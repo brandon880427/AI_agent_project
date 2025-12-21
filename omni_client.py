@@ -14,6 +14,54 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama2")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
 
 
+_MODEL_CACHE: Optional[List[str]] = None
+
+
+async def _list_ollama_models(client: httpx.AsyncClient) -> List[str]:
+    """Return available Ollama model names (best-effort)."""
+    global _MODEL_CACHE
+    if _MODEL_CACHE is not None:
+        return _MODEL_CACHE
+    try:
+        r = await client.get("/api/tags")
+        r.raise_for_status()
+        j = r.json()
+        models: List[str] = []
+        for m in (j.get("models") or []):
+            if isinstance(m, dict) and m.get("name"):
+                models.append(str(m["name"]))
+        _MODEL_CACHE = models
+        return models
+    except Exception:
+        _MODEL_CACHE = []
+        return []
+
+
+async def _choose_model(client: httpx.AsyncClient, requested: str) -> Tuple[Optional[str], Optional[str]]:
+    """Pick a usable model; returns (model_name, warning_message)."""
+    requested = (requested or "").strip()
+    models = await _list_ollama_models(client)
+    if not models:
+        # Can't reach Ollama or it has no models.
+        if requested:
+            return None, f"[OLLAMA] No models available (requested '{requested}'). Install a model or set OLLAMA_MODEL."
+        return None, "[OLLAMA] No models available. Install a model or set OLLAMA_MODEL."
+
+    if not requested:
+        return models[0], f"[OLLAMA] OLLAMA_MODEL not set; using '{models[0]}'."
+
+    # Exact match.
+    if requested in models:
+        return requested, None
+    # Common case: user sets base name (e.g. llama3) while tags include version.
+    prefix = requested + ":"
+    for m in models:
+        if m.startswith(prefix):
+            return m, f"[OLLAMA] Requested model '{requested}' not found; using '{m}'."
+
+    return models[0], f"[OLLAMA] Requested model '{requested}' not found; using '{models[0]}'."
+
+
 class OmniStreamPiece:
     """对外的统一增量数据：text/audio 二选一或同时。"""
     def __init__(self, text_delta: Optional[str] = None, audio_b64: Optional[str] = None):
@@ -56,9 +104,15 @@ async def stream_chat(
         headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
 
     async with httpx.AsyncClient(base_url=OLLAMA_URL, timeout=30.0, headers=headers) as client:
+        chosen_model, warn = await _choose_model(client, OLLAMA_MODEL)
+        if warn:
+            # Emit warning but continue if we have a model.
+            yield OmniStreamPiece(text_delta=warn)
+        if not chosen_model:
+            return
         try:
             resp = await client.post("/api/generate", json={
-                "model": OLLAMA_MODEL,
+                "model": chosen_model,
                 "prompt": prompt,
             })
         except Exception as e:
@@ -71,6 +125,42 @@ async def stream_chat(
             j = resp.json()
         except Exception:
             j = None
+
+        # Ollama may return error JSON like: {"error": "model 'xxx' not found"}
+        if isinstance(j, dict) and j.get("error"):
+            err = str(j.get("error"))
+            # If model missing, refresh cache once and retry with fallback.
+            if "not found" in err and "model" in err:
+                global _MODEL_CACHE
+                _MODEL_CACHE = None
+                chosen_model2, warn2 = await _choose_model(client, OLLAMA_MODEL)
+                if warn2:
+                    yield OmniStreamPiece(text_delta=warn2)
+                if chosen_model2 and chosen_model2 != chosen_model:
+                    try:
+                        resp2 = await client.post("/api/generate", json={
+                            "model": chosen_model2,
+                            "prompt": prompt,
+                        })
+                        try:
+                            j2 = resp2.json()
+                        except Exception:
+                            j2 = None
+                        if isinstance(j2, dict) and j2.get("error"):
+                            yield OmniStreamPiece(text_delta=f"[OLLAMA ERROR] {j2.get('error')}")
+                            return
+                        j = j2
+                        resp = resp2
+                        chosen_model = chosen_model2
+                    except Exception as e:
+                        yield OmniStreamPiece(text_delta=f"[OLLAMA ERROR] {e}")
+                        return
+                else:
+                    yield OmniStreamPiece(text_delta=f"[OLLAMA ERROR] {err}")
+                    return
+            else:
+                yield OmniStreamPiece(text_delta=f"[OLLAMA ERROR] {err}")
+                return
 
         def _extract_text(obj: Any) -> Optional[str]:
             # Try common shapes returned by Ollama
@@ -123,7 +213,7 @@ async def stream_chat(
         text_output = _extract_text(j) or (resp.text if resp.text else None)
 
         if not text_output:
-            yield OmniStreamPiece(text_delta="[OLLAMA] 无响应或解析失败")
+            yield OmniStreamPiece(text_delta="[OLLAMA] No response or parse failed")
             return
 
         # For now Ollama produces text; audio generation/tts is out-of-scope here.

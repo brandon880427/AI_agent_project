@@ -19,7 +19,11 @@ import httpx
 VISION_AGENT_PREPROCESS = os.getenv("VISION_AGENT_PREPROCESS", "1") != "0"
 VISION_AGENT_PREPROCESS_BRIGHTNESS = float(os.getenv("VISION_AGENT_PREPROCESS_BRIGHTNESS", "1.20"))
 VISION_AGENT_PREPROCESS_CONTRAST = float(os.getenv("VISION_AGENT_PREPROCESS_CONTRAST", "1.15"))
-VISION_AGENT_PREPROCESS_JPEG_QUALITY = int(os.getenv("VISION_AGENT_PREPROCESS_JPEG_QUALITY", "90"))
+VISION_AGENT_PREPROCESS_JPEG_QUALITY = int(os.getenv("VISION_AGENT_PREPROCESS_JPEG_QUALITY", "80"))
+VISION_AGENT_MAX_SIDE = int(os.getenv("VISION_AGENT_MAX_SIDE", "512"))
+VISION_AGENT_OLLAMA_READ_TIMEOUT_SEC = float(os.getenv("VISION_AGENT_OLLAMA_READ_TIMEOUT_SEC", "120"))
+VISION_AGENT_OLLAMA_NUM_PREDICT = int(os.getenv("VISION_AGENT_OLLAMA_NUM_PREDICT", os.getenv("OLLAMA_NUM_PREDICT", "120")))
+VISION_AGENT_OLLAMA_TEMPERATURE = float(os.getenv("VISION_AGENT_OLLAMA_TEMPERATURE", os.getenv("OLLAMA_TEMPERATURE", "0.2")))
 
 
 def _preprocess_jpeg(jpeg_bytes: bytes) -> bytes:
@@ -29,6 +33,14 @@ def _preprocess_jpeg(jpeg_bytes: bytes) -> bytes:
         from PIL import Image, ImageEnhance, ImageOps
 
         im = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+        if VISION_AGENT_MAX_SIDE and VISION_AGENT_MAX_SIDE > 0:
+            w, h = im.size
+            m = max(w, h)
+            if m > VISION_AGENT_MAX_SIDE:
+                scale = VISION_AGENT_MAX_SIDE / float(m)
+                nw = max(1, int(w * scale))
+                nh = max(1, int(h * scale))
+                im = im.resize((nw, nh), Image.BILINEAR)
         im = ImageOps.autocontrast(im)
         if abs(VISION_AGENT_PREPROCESS_BRIGHTNESS - 1.0) > 1e-3:
             im = ImageEnhance.Brightness(im).enhance(VISION_AGENT_PREPROCESS_BRIGHTNESS)
@@ -116,7 +128,7 @@ class VisionAgent:
             return await self._step_once_locked(user_task=user_task)
 
     async def _run_loop(self) -> None:
-        await self._emit_text("[AI] （agent）已启动。")
+        await self._emit_text("[AI] (agent) Started.")
         try:
             while not self._stop_evt.is_set():
                 t0 = time.monotonic()
@@ -124,9 +136,15 @@ class VisionAgent:
                     async with self._lock:
                         await self._step_once_locked(user_task=None)
                 except Exception as e:
-                    self._last_error = str(e)
+                    self._last_error = str(e).strip() or type(e).__name__
                     try:
-                        await self._emit_text(f"[AI] （agent）运行异常：{e}")
+                        if isinstance(e, httpx.ReadTimeout):
+                            msg = (
+                                "Timed out waiting for Ollama. Try smaller frames (VISION_AGENT_MAX_SIDE=512) or increase VISION_AGENT_OLLAMA_READ_TIMEOUT_SEC."
+                            )
+                        else:
+                            msg = str(e).strip() or type(e).__name__
+                        await self._emit_text(f"[AI] (agent) Error: {msg}")
                     except Exception:
                         pass
 
@@ -138,7 +156,7 @@ class VisionAgent:
                     pass
         finally:
             try:
-                await self._emit_text("[AI] （agent）已停止。")
+                await self._emit_text("[AI] (agent) Stopped.")
             except Exception:
                 pass
 
@@ -146,20 +164,20 @@ class VisionAgent:
         jpeg = self._get_latest_jpeg()
         if not jpeg:
             self._last_error = "no_frame"
-            await self._emit_text("[AI] （agent）当前没有相机画面，等待中…")
+            await self._emit_text("[AI] (agent) No camera frame yet; waiting...")
             return {"ok": False, "error": "no_frame"}
 
         system_prompt = (
-            "你是一个用于盲人辅助导航的视觉Agent。"
-            "你会看到来自胸前/眼镜相机的一帧画面。"
-            "你的目标：用中文给出非常简短、可执行的提醒（1-2句），"
-            "优先关注：障碍物/台阶/车辆/行人/红绿灯/斑马线/门口/转向。"
-            "如果画面不确定，请说不确定并给出保守建议。"
-            "输出必须是 JSON，字段固定为：summary, hazards, action。"
-            "hazards 是字符串数组；action 是一句可执行指令。"
+            "You are a vision agent for blind-assistance navigation. "
+            "You will see one frame from a chest/glasses camera. "
+            "Goal: provide very short, actionable guidance in ENGLISH (1-2 sentences). "
+            "Prioritize: obstacles/steps/vehicles/pedestrians/traffic lights/crosswalks/doors/turning. "
+            "If uncertain, say so and give conservative advice. "
+            "Output MUST be JSON only with fixed fields: summary, hazards, action. "
+            "hazards is an array of short strings; action is one executable instruction."
         )
 
-        user_prompt = (user_task or "请分析当前画面并给出提醒。")
+        user_prompt = (user_task or "Analyze the current frame and give guidance.")
 
         jpeg = _preprocess_jpeg(jpeg)
         img_b64 = base64.b64encode(jpeg).decode("ascii")
@@ -173,10 +191,14 @@ class VisionAgent:
         payload = {
             "model": self._ollama_model,
             "stream": False,
+            "options": {
+                "num_predict": VISION_AGENT_OLLAMA_NUM_PREDICT,
+                "temperature": VISION_AGENT_OLLAMA_TEMPERATURE,
+            },
             "messages": messages,
         }
 
-        timeout = httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=5.0)
+        timeout = httpx.Timeout(connect=5.0, read=VISION_AGENT_OLLAMA_READ_TIMEOUT_SEC, write=30.0, pool=5.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(f"{self._ollama_url}/api/chat", json=payload)
             r.raise_for_status()
@@ -201,9 +223,9 @@ class VisionAgent:
         except Exception:
             # Fallback: wrap plain text
             obj = {
-                "summary": content[:200] if content else "（空）",
+                "summary": content[:200] if content else "(empty)",
                 "hazards": [],
-                "action": "请放慢脚步，注意周围环境。",
+                "action": "Slow down and watch your surroundings.",
             }
 
         summary = str(obj.get("summary") or "").strip()
@@ -220,8 +242,8 @@ class VisionAgent:
         self._last_error = ""
 
         # Emit as one concise chat line.
-        haz_txt = ("；".join(hazards)) if hazards else "无"
-        out = f"[AI] （agent）{summary} | 风险: {haz_txt} | 建议: {action}"
+        haz_txt = ("; ".join(hazards)) if hazards else "none"
+        out = f"[AI] (agent) {summary} | hazards: {haz_txt} | action: {action}"
         await self._emit_text(out)
 
         return {"ok": True, "raw": content, "parsed": obj}

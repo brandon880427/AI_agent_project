@@ -246,12 +246,19 @@
           });
           $btnClear?.addEventListener('click', () => { if ($chat) $chat.innerHTML = ''; });
 
+          let describeInFlight = false;
           $btnDescribe?.addEventListener('click', async () => {
+            if (describeInFlight) return;
+            describeInFlight = true;
+            try { if ($btnDescribe) $btnDescribe.disabled = true; } catch (e) {}
             addMessage('[UI] describe requested', true);
             try {
               await postJson('/api/describe', { prompt: null });
             } catch (e) {
               addMessage(`[UI] describe failed: ${e}`);
+            } finally {
+              describeInFlight = false;
+              try { if ($btnDescribe) $btnDescribe.disabled = false; } catch (e) {}
             }
           });
 
@@ -286,7 +293,9 @@
           });
 
           document.addEventListener('keydown', (e) => {
-            if (e.key === 'd' || e.key === 'D') {
+            // Hotkey: Cmd/Ctrl+D (ignore key-repeat)
+            if (e.repeat) return;
+            if ((e.key === 'd' || e.key === 'D') && (e.metaKey || e.ctrlKey)) {
               e.preventDefault();
               $btnDescribe?.click();
             }

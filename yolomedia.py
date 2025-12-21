@@ -17,6 +17,9 @@ import os
 import time
 import threading
 import math
+import re
+from pathlib import Path
+import shutil
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -32,6 +35,327 @@ HAND_DOWNSCALE = 0.8      # HandLandmarker 的输入缩放 0.5=长宽各减半�
 HAND_FPS_DIV = 1          # 人手每 2 帧跑一次（1=每帧；2=隔帧；3=每3帧）
 
 
+# ========= 扑克牌识别（检测） =========
+# 约定：训练集的 class name 建议为：AS/10H/KD/2C 或 A_spades/10_hearts 等。
+CARDS_MODEL_PATH = os.getenv("CARDS_MODEL_PATH", os.path.join("model", "cards.pt"))
+CARDS_CONF = float(os.getenv("CARDS_CONF", "0.25"))
+CARDS_IOU = float(os.getenv("CARDS_IOU", "0.45"))
+CARDS_IMGSZ = int(os.getenv("CARDS_IMGSZ", "640"))
+CARDS_INFER_EVERY = int(os.getenv("CARDS_INFER_EVERY", "1"))
+CARDS_MAX_DETS = int(os.getenv("CARDS_MAX_DETS", "30"))
+
+
+def _project_root_dir() -> Path:
+    # yolomedia.py sits at repo root in this project
+    return Path(__file__).resolve().parent
+
+
+def _resolve_cards_model_path() -> Path:
+    """Resolve CARDS_MODEL_PATH against project root (not current working dir)."""
+    p = (CARDS_MODEL_PATH or "").strip()
+    if not p:
+        p = os.path.join("model", "cards.pt")
+    path = Path(p)
+    if not path.is_absolute():
+        path = _project_root_dir() / path
+    return path
+
+
+def _try_repair_cards_model(dst_path: Path) -> Path | None:
+    """Best-effort: copy a cards weights file into dst_path if missing/broken."""
+    try:
+        root = _project_root_dir()
+        candidates: list[Path] = []
+        # Primary: training artifacts we previously staged.
+        candidates.extend(sorted((root / ".tmp_cards_repo" / "final_models").glob("*.pt")))
+        # Secondary: any other pt in repo root/model.
+        candidates.extend(sorted((root / "model").glob("*.pt")))
+
+        # Remove self.
+        candidates = [p for p in candidates if p.exists() and p.is_file() and p.resolve() != dst_path.resolve()]
+        if not candidates:
+            return None
+
+        # Prefer newest large file.
+        candidates.sort(key=lambda p: (p.stat().st_size, p.stat().st_mtime), reverse=True)
+        src = candidates[0]
+
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst_path)
+        print(f"[CARDS] repaired model: {src} -> {dst_path}", flush=True)
+        return dst_path
+    except Exception as e:
+        print(f"[CARDS] repair attempt failed: {e}", flush=True)
+        return None
+
+
+def _load_cards_model(model_path: Path):
+    try:
+        model = YOLO(str(model_path))
+        # 仅在可用时用 GPU
+        try:
+            import torch
+
+            model.to("cuda" if torch.cuda.is_available() else "cpu")
+        except Exception:
+            pass
+        return model, None
+    except Exception as e:
+        return None, str(e)
+
+
+_CARD_SUIT_ALIASES = {
+    "s": "spades",
+    "spade": "spades",
+    "spades": "spades",
+    "♠": "spades",
+    "黑桃": "spades",
+    "h": "hearts",
+    "heart": "hearts",
+    "hearts": "hearts",
+    "♥": "hearts",
+    "红桃": "hearts",
+    "紅桃": "hearts",
+    "d": "diamonds",
+    "diamond": "diamonds",
+    "diamonds": "diamonds",
+    "♦": "diamonds",
+    "方块": "diamonds",
+    "方塊": "diamonds",
+    "c": "clubs",
+    "club": "clubs",
+    "clubs": "clubs",
+    "♣": "clubs",
+    "梅花": "clubs",
+}
+
+
+_CARD_SUIT_SYMBOL = {
+    "spades": "♠",
+    "hearts": "♥",
+    "diamonds": "♦",
+    "clubs": "♣",
+}
+
+
+def _is_cards_prompt(prompt_name: str) -> bool:
+    if not prompt_name:
+        return False
+    t = str(prompt_name).strip().lower()
+    if ("扑克牌" in t) or ("撲克牌" in t) or ("卡牌" in t) or ("纸牌" in t) or ("撲克" in t) or ("扑克" in t):
+        return True
+    t2 = re.sub(r"[^a-z0-9]+", "", t)
+    return t2 in {"cards", "playingcards", "poker", "pokercards", "card"} or ("playingcard" in t2)
+
+
+def _parse_card_label_to_rank_suit(label: str):
+    """从类名解析 rank/suit。
+
+    支持：AS、10H、kd、a_spades、10_hearts、king_of_diamonds 等。
+    返回：(rank, suit) 其中 suit 为 spades/hearts/diamonds/clubs。
+    """
+    if not label:
+        return None, None
+
+    raw = str(label).strip()
+    if not raw:
+        return None, None
+
+    # 先保留花色符号与字母数字，其他分隔成空格
+    low = raw.lower()
+    s = re.sub(r"[^a-z0-9♠♥♦♣一二三四五六七八九十j q k a]+", " ", low)
+    s = " ".join(s.split())
+
+    # 处理单 token 的常见形式：as / 10h / kd / 2c
+    if " " not in s:
+        t = s
+        # 将 10 优先匹配
+        for r in ("10", "a", "k", "q", "j", "9", "8", "7", "6", "5", "4", "3", "2"):
+            if t.startswith(r):
+                rest = t[len(r):]
+                rank = r
+                suit = _CARD_SUIT_ALIASES.get(rest)
+                if suit:
+                    return _canon_rank(rank), suit
+        # 可能是 "spadesa" 这种反过来的
+        for suit_key, suit in _CARD_SUIT_ALIASES.items():
+            if suit_key and t.startswith(suit_key):
+                rest = t[len(suit_key):]
+                if rest:
+                    return _canon_rank(rest), suit
+        return None, None
+
+    tokens = s.split(" ")
+
+    # suit
+    suit = None
+    for tok in tokens:
+        if tok in _CARD_SUIT_ALIASES:
+            suit = _CARD_SUIT_ALIASES[tok]
+            break
+
+    # rank
+    rank = None
+    rank_aliases = {
+        "a": "A",
+        "ace": "A",
+        "k": "K",
+        "king": "K",
+        "q": "Q",
+        "queen": "Q",
+        "j": "J",
+        "jack": "J",
+    }
+    for tok in tokens:
+        if tok in rank_aliases:
+            rank = rank_aliases[tok]
+            break
+        if tok.isdigit() and 2 <= int(tok) <= 10:
+            rank = tok
+            break
+
+    return rank, suit
+
+
+def _canon_rank(rank: str) -> str:
+    if not rank:
+        return ""
+    r = str(rank).strip().lower()
+    if r in ("a", "ace"):
+        return "A"
+    if r in ("k", "king"):
+        return "K"
+    if r in ("q", "queen"):
+        return "Q"
+    if r in ("j", "jack"):
+        return "J"
+    if r.isdigit():
+        try:
+            v = int(r)
+            if 2 <= v <= 10:
+                return str(v)
+        except Exception:
+            pass
+    return str(rank).strip().upper()
+
+
+def _card_label_to_display(label: str) -> str:
+    rank, suit = _parse_card_label_to_rank_suit(label)
+    if rank and suit:
+        sym = _CARD_SUIT_SYMBOL.get(suit, "")
+        return f"{rank}{sym}" if sym else f"{rank} {suit}"
+    return str(label)
+
+
+def _run_cards_mode(*, headless: bool, stop_event=None):
+    """专用：扑克牌检测 + 牌面(数字/花色)标注。"""
+    print("[CARDS] starting cards detection mode", flush=True)
+    model_path = _resolve_cards_model_path()
+    model = None
+
+    if not model_path.exists():
+        print(f"[CARDS] model not found: {model_path}", flush=True)
+        _try_repair_cards_model(model_path)
+
+    if model_path.exists():
+        model, err = _load_cards_model(model_path)
+        if model is None:
+            print(f"[CARDS] model load failed: {err}", flush=True)
+            # one more try: repair+reload
+            repaired = _try_repair_cards_model(model_path)
+            if repaired and repaired.exists():
+                model, err2 = _load_cards_model(repaired)
+                if model is None:
+                    print(f"[CARDS] model load failed (after repair): {err2}", flush=True)
+            if model is not None:
+                print(f"[CARDS] model loaded (after repair): {model_path}", flush=True)
+        else:
+            print(f"[CARDS] model loaded: {model_path}", flush=True)
+
+    frame_idx = 0
+    last_dets = []
+
+    while True:
+        if stop_event and stop_event.is_set():
+            print("[CARDS] stop signal received", flush=True)
+            break
+
+        frame = bridge_io.wait_raw_bgr(timeout_sec=0.5)
+        if frame is None:
+            if headless:
+                cv2.waitKey(1)
+            continue
+
+        vis = frame.copy()
+        H, W = vis.shape[:2]
+
+        if model is None:
+            ui_reset_overlay(H)
+            draw_text_cn(
+                vis,
+                f"Cards model not ready: {model_path}",
+                (10, 30),
+                font_size=18,
+                color=FRONTEND_COLORS["err"],
+                stroke=(0, 0, 0),
+            )
+            bridge_io.send_vis_bgr(vis)
+            frame_idx += 1
+            continue
+
+        # 推理（可降频）
+        do_infer = (CARDS_INFER_EVERY <= 1) or (frame_idx % CARDS_INFER_EVERY == 0)
+        if do_infer:
+            try:
+                r = model.predict(
+                    vis,
+                    conf=CARDS_CONF,
+                    iou=CARDS_IOU,
+                    imgsz=CARDS_IMGSZ,
+                    max_det=CARDS_MAX_DETS,
+                    verbose=False,
+                )[0]
+                names = getattr(r, "names", {}) or {}
+                boxes = getattr(r, "boxes", None)
+                dets = []
+                if boxes is not None and getattr(boxes, "xyxy", None) is not None:
+                    xyxy = boxes.xyxy.cpu().numpy()
+                    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else None
+                    clss = boxes.cls.cpu().numpy().astype(int) if boxes.cls is not None else None
+                    for i in range(len(xyxy)):
+                        x1, y1, x2, y2 = xyxy[i]
+                        cid = int(clss[i]) if clss is not None else 0
+                        conf = float(confs[i]) if confs is not None else 0.0
+                        label = names.get(cid, str(cid))
+                        dets.append((x1, y1, x2, y2, conf, label))
+                last_dets = dets
+            except Exception as e:
+                print(f"[CARDS] infer failed: {e}", flush=True)
+
+        # 叠加显示
+        ui_reset_overlay(H)
+        draw_text_cn(vis, f"Cards detected: {len(last_dets)}", (10, 30), font_size=18, color=FRONTEND_COLORS["text"], stroke=(0, 0, 0))
+
+        for (x1, y1, x2, y2, conf, label) in last_dets:
+            x1i = int(max(0, min(W - 1, round(x1))))
+            y1i = int(max(0, min(H - 1, round(y1))))
+            x2i = int(max(0, min(W - 1, round(x2))))
+            y2i = int(max(0, min(H - 1, round(y2))))
+            cv2.rectangle(vis, (x1i, y1i), (x2i, y2i), (0, 255, 255), 2)
+
+            disp = _card_label_to_display(label)
+            # 放在框左上角上方
+            tx = x1i
+            ty = max(0, y1i - 6)
+            draw_text_cn(vis, f"{disp}", (tx, ty), font_size=18, color=FRONTEND_COLORS["ok"], stroke=(0, 0, 0), ui_hint=False)
+
+        bridge_io.send_vis_bgr(vis)
+        if headless:
+            cv2.waitKey(1)
+        frame_idx += 1
+
+
+
 # === 前端风格配色（BGR） + UI叠加管理（左下角按行堆叠） ===
 FRONTEND_COLORS = {
     "text": (230, 237, 243),   # --text: #e6edf3
@@ -43,6 +367,27 @@ FRONTEND_COLORS = {
 
 # 底部指令按钮文本
 CURRENT_COMMAND_TEXT = "—"
+
+
+_DIRECTION_DISPLAY = {
+    "向上": "Up",
+    "向下": "Down",
+    "向左": "Left",
+    "向右": "Right",
+    "向前": "Forward",
+    "后退": "Back",
+    "後退": "Back",
+    "保持": "Hold",
+    "已居中": "Centered",
+    "OK": "OK",
+}
+
+
+def _display_direction(direction: str) -> str:
+    if direction is None:
+        return ""
+    s = str(direction).strip()
+    return _DIRECTION_DISPLAY.get(s, s)
 
 _UI_LINE = 0
 _UI_H = 0
@@ -79,7 +424,7 @@ def set_current_command(text: str):
 
 def draw_command_pill(img_bgr: np.ndarray, label: str):
     """统一改为右上角白色文案。不再绘制底部圆角按钮。"""
-    text_prefix = "当前指令："
+    text_prefix = "Command: "
     full_text = f"{text_prefix}{label if label else '—'}"
     # 直接用统一文本渲染
     draw_text_cn(img_bgr, full_text, (0, 0), font_size=UNIFIED_FONT_PX, color=(255,255,255), ui_hint=True)
@@ -327,8 +672,8 @@ def draw_progress_bars(vis, align_score, range_score):
     # 填充
     cv2.rectangle(vis, (x0, y0), (x0 + int(bar_w * clamp01(align_score)), y0 + bar_h), (0, 220, 0), -1)
     cv2.rectangle(vis, (x0, y0 + bar_h + gap), (x0 + int(bar_w * clamp01(range_score)), y0 + 2*bar_h + gap), (0, 180, 255), -1)
-    draw_text_cn(vis, "对齐",       (x0, y0 - 18),                 font_size=18, color=(180,180,180))
-    draw_text_cn(vis, "距离(≈1)",   (x0, y0 + bar_h + gap - 18),   font_size=18, color=(180,180,180))
+    draw_text_cn(vis, "Align",         (x0, y0 - 18),                 font_size=18, color=(180,180,180))
+    draw_text_cn(vis, "Distance (~1)", (x0, y0 + bar_h + gap - 18),   font_size=18, color=(180,180,180))
 
 def polygon_center_and_area(poly):
     if poly is None or len(poly) < 3:
@@ -563,7 +908,7 @@ def get_guidance_direction(hand_center, object_center, hand_area, object_area, h
     
     # 如果手和物体已经接触，直接返回"向前"
     if is_touching:
-        return "向前", f"接触度: {overlap_ratio:.1%}"
+        return "向前", f"Touch: {overlap_ratio:.1%}"
     
     # 如果没有接触，引导上下左右
     # 判断主要方向
@@ -592,7 +937,7 @@ def get_guidance_direction(hand_center, object_center, hand_area, object_area, h
         # 已经在中心附近但还没接触，提示靠近
         distance = np.sqrt(dx**2 + dy**2)
         if distance < 50:  # 很近但还没接触
-            return "向前", "请缓慢靠近"
+            return "向前", "Move closer slowly"
         else:
             return "保持", None
 
@@ -604,7 +949,7 @@ def play_guidance_audio(direction):
     # 同步更新底部按钮的指令文本
     try:
         if isinstance(direction, str) and direction.strip():
-            set_current_command(direction.strip())
+            set_current_command(_display_direction(direction.strip()))
     except Exception:
         pass
 
@@ -646,6 +991,11 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
 
 
 
+
+    # === 专用模式：扑克牌识别（bbox + 牌面标注） ===
+    if _is_cards_prompt(prompt_name or ""):
+        _run_cards_mode(headless=headless, stop_event=stop_event)
+        return
 
     # 如果传入了 prompt_name，使用它替换全局的 PROMPT_NAME
     global PROMPT_NAME
@@ -831,7 +1181,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                     #     x0, y0, w0, h0 = hand_box
                     #     cv2.rectangle(vis, (x0, y0), (x0+w0, y0+h0), (0,255,255), 1)
                     grasp_now, grasp_score = detect_grasp(l0, W, H)
-                    draw_text_cn(vis, f"握持评分: {grasp_score:.2f}", (10, 70), font_size=18, color=(0, 180, 255))
+                    draw_text_cn(vis, f"Grasp score: {grasp_score:.2f}", (10, 70), font_size=18, color=(0, 180, 255))
                     
 
             if MODE == "SEGMENT":
@@ -888,7 +1238,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
 
                 else:
                     # YOLOE 未就绪：提示并保持原画面（不阻塞前端）
-                    draw_text_cn(vis, "YOLOE 未就绪，显示原始画面", (10, 100), font_size=22, color=(0, 215, 255))
+                    draw_text_cn(vis, "YOLOE not ready, showing raw frame", (10, 100), font_size=22, color=(0, 215, 255))
 
                 # 选择面积最大的mask  ←—— 这一行下面开始保留你的原代码
 
@@ -911,11 +1261,11 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                             cv2.circle(vis, (cx, cy), 8, (0, 255, 0), 2)
                             cv2.circle(vis, (cx, cy), 12, (0, 255, 0), 1)
                             # 目标标签：保持就地标注
-                            draw_text_cn(vis, "目标", (cx + 15, cy - 5), font_size=16, color=FRONTEND_COLORS["ok"], ui_hint=False)
+                            draw_text_cn(vis, "Target", (cx + 15, cy - 5), font_size=16, color=FRONTEND_COLORS["ok"], ui_hint=False)
                     
                     # 显示检测信息
                     if len(candidate_masks) > 1:
-                        draw_text_cn(vis, f"检测到{len(candidate_masks)}个物体，选择最大的（面积: {largest_mask_info['area']}）", 
+                        draw_text_cn(vis, f"Detected {len(candidate_masks)} objects, using largest (area: {largest_mask_info['area']})", 
                                    (10, H - 30), font_size=16, color=(255, 255, 0))
                 
                 # 自动锁定逻辑
@@ -930,7 +1280,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                     
                     if remaining > 0:
                         # 显示倒计时（移动到左下角，前端风格）
-                        draw_text_cn(vis, f"检测到物体，{remaining:.1f}秒后自动锁定", (10, 100), font_size=16, color=FRONTEND_COLORS["text"], stroke=(0,0,0))
+                        draw_text_cn(vis, f"Object detected, auto-lock in {remaining:.1f}s", (10, 100), font_size=16, color=FRONTEND_COLORS["text"], stroke=(0,0,0))
                         
                         # 绘制锁定框 - 使用虚线框表示正在准备锁定
                         if last_detected_mask is not None:
@@ -969,7 +1319,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                         print("[AUTO] 物体丢失，重置倒计时")
                     auto_lock_start_time = None
                     last_detected_mask = None
-                    draw_text_cn(vis, "分割中... 等待检测到物体", (10, 100), font_size=16, color=FRONTEND_COLORS["muted"])
+                    draw_text_cn(vis, "Segmenting... waiting for object", (10, 100), font_size=16, color=FRONTEND_COLORS["muted"])
 
             elif MODE == "FLASH":
                 # 闪烁动画模式
@@ -1002,7 +1352,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                             cv2.drawContours(vis, contours, -1, contour_color, STROKE_WIDTH + 1)
                         
                         # 显示提示文字（左下角）
-                        draw_text_cn(vis, "正在锁定目标...", (10, 100), font_size=18, color=FRONTEND_COLORS["accent"]) 
+                        draw_text_cn(vis, "Locking target...", (10, 100), font_size=18, color=FRONTEND_COLORS["accent"]) 
                     else:
                         # 闪烁结束，初始化光流追踪并进入居中引导模式
                         print("[AUTO] 闪烁结束，初始化光流追踪")
@@ -1157,13 +1507,14 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                             last_center_guide_time = t_now
                                             play_guidance_audio("OK")
                                             try:
-                                                bridge_io.send_ui_final("✓ 物品已居中！")
+                                                bridge_io.send_ui_final("✓ Object centered!")
                                             except Exception:
                                                 pass
-                                            draw_text_cn(vis, "✓ 物品已居中！", (10, 60), font_size=18, color=FRONTEND_COLORS["ok"]) 
+                                            draw_text_cn(vis, "✓ Object centered!", (10, 60), font_size=18, color=FRONTEND_COLORS["ok"]) 
                                         else:
                                             # 显示引导文字
-                                            msg = f"请将物品移到画面中心: {direction}"
+                                            direction_en = _display_direction(direction)
+                                            msg = f"Move object to center: {direction_en}"
                                             try:
                                                 # 节流：每次语音播报也推一次final
                                                 if t_now - last_center_guide_time > GUIDANCE_INTERVAL_SEC:
@@ -1177,7 +1528,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                             dx = frame_center[0] - object_center[0]
                                             dy = frame_center[1] - object_center[1]
                                             distance = int(np.sqrt(dx**2 + dy**2))
-                                            draw_text_cn(vis, f"距离: {distance}px", 
+                                            draw_text_cn(vis, f"Distance: {distance}px", 
                                                        (10, 60), font_size=16, color=FRONTEND_COLORS["muted"])
                                             
                                             # 播放语音引导
@@ -1187,24 +1538,24 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                     else:
                                         # 已经居中，显示成功信息
                                         try:
-                                            bridge_io.send_ui_final("✓ 物品已成功移到中心！")
+                                            bridge_io.send_ui_final("✓ Object moved to center!")
                                         except Exception:
                                             pass
-                                        draw_text_cn(vis, "✓ 物品已成功移到中心！", 
+                                        draw_text_cn(vis, "✓ Object moved to center!", 
                                                    (10, 60), font_size=18, color=FRONTEND_COLORS["ok"])
                                         
                                         # 等待1秒后进入手部追踪模式
                                         if t_now - last_center_guide_time > 1.0:
                                             print("[CENTER] 进入手部追踪模式")
                                             try:
-                                                bridge_io.send_ui_final("进入手部追踪模式")
+                                                bridge_io.send_ui_final("Entering hand tracking mode")
                                             except Exception:
                                                 pass
                                             MODE = "TRACK"
                                             # 保持当前的光流追踪状态
                                 else:
                                     # 多边形中心计算失败，显示警告
-                                    draw_text_cn(vis, "正在追踪物体...", (10, 100), font_size=20, color=(255, 255, 0))
+                                    draw_text_cn(vis, "Tracking object...", (10, 100), font_size=20, color=(255, 255, 0))
                         else:
                             # 光流点数不足，尝试重新检测
                             MODE = "SEGMENT"
@@ -1379,16 +1730,17 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                     )
                                     
                                     if direction and direction != "保持":
+                                        direction_en = _display_direction(direction)
                                         # 根据是否接触显示不同颜色
                                         if direction == "向前":
                                             # 手已经接触物体，用绿色显示
                                             guide_color = (0, 255, 0)  # 绿色
-                                            draw_text_cn(vis, f"引导: {direction} - 伸手抓取", (W//2 - 80, 40), 
+                                            draw_text_cn(vis, f"Guide: {direction_en} - Reach and grasp", (W//2 - 80, 40), 
                                                        font_size=24, color=guide_color, stroke=(0, 0, 0))
                                         else:
                                             # 还未接触，用黄色显示
                                             guide_color = (0, 255, 255)  # 黄色
-                                            draw_text_cn(vis, f"引导: {direction}", (W//2 - 60, 40), 
+                                            draw_text_cn(vis, f"Guide: {direction_en}", (W//2 - 60, 40), 
                                                        font_size=24, color=guide_color, stroke=(0, 0, 0))
                                         
                                         # 显示次要信息（接触度或其他方向）
@@ -1399,7 +1751,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                                            font_size=18, color=(0, 255, 0))
                                             else:
                                                 # 其他方向信息
-                                                draw_text_cn(vis, f"（或 {secondary}）", (W//2 - 60, 70), 
+                                                draw_text_cn(vis, f"(or {_display_direction(secondary)})", (W//2 - 60, 70), 
                                                            font_size=18, color=(200, 200, 200))
                                         
                                         # 播放语音引导 - 确保每个方向都会播放
@@ -1416,14 +1768,14 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                 # 显示接触状态
                                 is_touching, overlap_ratio = check_hand_object_contact(hand_box, poly, overlap_threshold=0.1)
                                 if is_touching:
-                                    draw_text_cn(vis, f"状态: 已接触 ({overlap_ratio:.1%})", (10, 95), 
+                                    draw_text_cn(vis, f"Status: Touching ({overlap_ratio:.1%})", (10, 95), 
                                                font_size=16, color=(0, 255, 0))
                                 else:
                                     # 计算手和物体的距离
                                     if hand_center and poly_center:
                                         distance = np.sqrt((hand_center[0] - poly_center[0])**2 + 
                                                          (hand_center[1] - poly_center[1])**2)
-                                        draw_text_cn(vis, f"距离: {distance:.0f}px", (10, 95), 
+                                        draw_text_cn(vis, f"Distance: {distance:.0f}px", (10, 95), 
                                                    font_size=16, color=FRONTEND_COLORS["muted"])
 
                                 # 成功条件：握持（放宽）
@@ -1469,7 +1821,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
   
 
                 if MODE == "SEGMENT":
-                    draw_text_cn(vis, "追踪丢失 → 正在重新识别。按 Enter 重新锁定", (10, 100), font_size=22, color=(0,0,255))
+                    draw_text_cn(vis, "Tracking lost -> re-detecting. Press Enter to re-lock", (10, 100), font_size=22, color=(0,0,255))
 
                 old_gray = gray
 

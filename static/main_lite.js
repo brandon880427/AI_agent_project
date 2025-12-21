@@ -9,6 +9,7 @@
   const $btnReconnect = document.getElementById('btnReconnect');
   const $btnClear = document.getElementById('btnClear');
   const $btnDescribe = document.getElementById('btnDescribe');
+  const $btnCards = document.getElementById('btnCards');
   const $btnAgentStep = document.getElementById('btnAgentStep');
   const $btnAgentStart = document.getElementById('btnAgentStart');
   const $btnAgentStop = document.getElementById('btnAgentStop');
@@ -238,6 +239,68 @@
     return await r.json();
   }
 
+  async function sendPromptWsAudio(promptText) {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const url = `${proto}://${location.host}/ws_audio`;
+    return await new Promise((resolve, reject) => {
+      let done = false;
+      let ws;
+      try {
+        ws = new WebSocket(url);
+      } catch (e) {
+        reject(e);
+        return;
+      }
+
+      const timeout = setTimeout(() => {
+        if (done) return;
+        done = true;
+        try { ws.close(); } catch (e) {}
+        reject(new Error('ws_audio timeout'));
+      }, 2000);
+
+      ws.onopen = () => {
+        try {
+          ws.send(`PROMPT:${promptText}`);
+        } catch (e) {
+          clearTimeout(timeout);
+          if (!done) {
+            done = true;
+            try { ws.close(); } catch (e2) {}
+            reject(e);
+          }
+        }
+      };
+
+      ws.onmessage = (ev) => {
+        const msg = String(ev.data || '');
+        if (done) return;
+        if (msg.startsWith('OK:')) {
+          done = true;
+          clearTimeout(timeout);
+          try { ws.close(); } catch (e) {}
+          resolve(msg);
+        }
+      };
+
+      ws.onerror = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timeout);
+        try { ws.close(); } catch (e) {}
+        reject(new Error('ws_audio error'));
+      };
+
+      ws.onclose = () => {
+        if (done) return;
+        // If closed without OK, treat as failure.
+        done = true;
+        clearTimeout(timeout);
+        reject(new Error('ws_audio closed'));
+      };
+    });
+  }
+
   $btnReconnect?.addEventListener('click', () => {
     connectCamera();
     connectUi();
@@ -248,12 +311,28 @@
     if ($chat) $chat.innerHTML = '';
   });
 
+  let describeInFlight = false;
   $btnDescribe?.addEventListener('click', async () => {
+    if (describeInFlight) return;
+    describeInFlight = true;
+    try { if ($btnDescribe) $btnDescribe.disabled = true; } catch (e) {}
     addMessage('[UI] describe requested', true);
     try {
       await postJson('/api/describe', { prompt: null });
     } catch (e) {
       addMessage(`[UI] describe failed: ${e}`);
+    } finally {
+      describeInFlight = false;
+      try { if ($btnDescribe) $btnDescribe.disabled = false; } catch (e) {}
+    }
+  });
+
+  $btnCards?.addEventListener('click', async () => {
+    addMessage('[UI] cards mode requested', true);
+    try {
+      await sendPromptWsAudio('cards');
+    } catch (e) {
+      addMessage(`[UI] cards mode failed: ${e}`);
     }
   });
 
@@ -288,7 +367,9 @@
   });
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'd' || e.key === 'D') {
+    // Hotkey: Cmd/Ctrl+D (ignore key-repeat)
+    if (e.repeat) return;
+    if ((e.key === 'd' || e.key === 'D') && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       $btnDescribe?.click();
     }

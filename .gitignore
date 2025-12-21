@@ -4,6 +4,12 @@ __pycache__/
 *.pyo
 *.pyd
 venv/
+.venv/
+.venv_*/
+
+# Temp repos / training outputs
+.tmp_*/
+runs/
 
 # Local env/secrets
 .env
@@ -32,6 +38,9 @@ model/*.pt
 model/*.pth
 model/*.onnx
 model/*.engine
+
+# Keep the pretrained cards model in repo (≈50MB, under GitHub limit)
+!model/cards.pt
 
 # OS
 .DS_Store

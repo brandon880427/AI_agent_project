@@ -56,7 +56,7 @@ except Exception:
 # LLM (Ollama) settings
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama2")
-OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava")  # e.g. llava / llama3.2-vision
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava:latest")  # e.g. llava:latest / llama3.2-vision
 
 # ASR model name (if using DashScope ASR)
 MODEL = os.getenv("DASHSCOPE_ASR_MODEL", "paraformer-realtime-v2")
@@ -108,7 +108,7 @@ ENABLE_AUDIO_SYSTEM = os.getenv("ENABLE_AUDIO_SYSTEM", "0" if LITE_MODE else "1"
 ENABLE_NAV_MODELS = os.getenv("ENABLE_NAV_MODELS", "0" if LITE_MODE else "1") != "0"
 ENABLE_TRAFFIC_LIGHT = os.getenv("ENABLE_TRAFFIC_LIGHT", "0" if LITE_MODE else "1") != "0"
 ENABLE_UDP = os.getenv("ENABLE_UDP", "0" if LITE_MODE else "1") != "0"
-AGENT_AUTOSTART = os.getenv("AGENT_AUTOSTART", "1" if LITE_MODE else "0") != "0"
+AGENT_AUTOSTART = os.getenv("AGENT_AUTOSTART", "0") != "0"
 
 # ---- Camera streaming knobs (env) ----
 # Keep defaults matching current behavior as much as possible.
@@ -117,7 +117,11 @@ CAMERA_RECORD_ENABLED = os.getenv("CAMERA_RECORD_ENABLED", "0" if LITE_MODE else
 VIEWER_SEND_RAW_JPEG = os.getenv("VIEWER_SEND_RAW_JPEG", "1") != "0"  # if possible, forward ESP32 JPEG directly
 VIEWER_MAX_FPS = float(os.getenv("VIEWER_MAX_FPS", "12"))  # global cap; 0 disables
 VIEWER_SEND_TIMEOUT_SEC = float(os.getenv("VIEWER_SEND_TIMEOUT_SEC", "0.25"))
+VIEWER_MAX_CLIENTS = int(os.getenv("VIEWER_MAX_CLIENTS", "8"))  # 0 disables cap
 CAMERA_PROFILE = os.getenv("CAMERA_PROFILE", "0") != "0"  # print per-stage timings periodically
+
+# If ESP32 camera socket stays connected but stops sending frames, force reconnect.
+ESP32_CAMERA_RX_TIMEOUT_SEC = float(os.getenv("ESP32_CAMERA_RX_TIMEOUT_SEC", "8"))
 
 app = FastAPI()
 
@@ -145,10 +149,14 @@ ESP32_STREAM_FPS = int(os.getenv("ESP32_STREAM_FPS", "12"))
 VISION_PREPROCESS = os.getenv("VISION_PREPROCESS", "1") != "0"
 VISION_PREPROCESS_BRIGHTNESS = float(os.getenv("VISION_PREPROCESS_BRIGHTNESS", "1.20"))
 VISION_PREPROCESS_CONTRAST = float(os.getenv("VISION_PREPROCESS_CONTRAST", "1.15"))
-VISION_PREPROCESS_JPEG_QUALITY = int(os.getenv("VISION_PREPROCESS_JPEG_QUALITY", "90"))
+VISION_PREPROCESS_JPEG_QUALITY = int(os.getenv("VISION_PREPROCESS_JPEG_QUALITY", "80"))
+VISION_MAX_SIDE = int(os.getenv("VISION_MAX_SIDE", "512"))
+VISION_OLLAMA_READ_TIMEOUT_SEC = float(os.getenv("VISION_OLLAMA_READ_TIMEOUT_SEC", "120"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "120"))
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))
 
 # ===== ESP32 HQ snapshot support (SNAP:HQ) =====
-VISION_DESCRIBE_USE_HQ_SNAPSHOT = os.getenv("VISION_DESCRIBE_USE_HQ_SNAPSHOT", "1") != "0"
+VISION_DESCRIBE_USE_HQ_SNAPSHOT = os.getenv("VISION_DESCRIBE_USE_HQ_SNAPSHOT", "0") != "0"
 VISION_HQ_SNAPSHOT_TIMEOUT_SEC = float(os.getenv("VISION_HQ_SNAPSHOT_TIMEOUT_SEC", "2.5"))
 _esp32_snapshot_active: bool = False
 _esp32_last_snapshot_jpeg: Optional[bytes] = None
@@ -164,6 +172,60 @@ _viewer_last_sent_t: float = 0.0
 # Vision describe (Ollama) runtime state
 _describe_lock = asyncio.Lock()
 
+_ollama_models_cache: Optional[list[str]] = None
+
+
+async def _ollama_list_models() -> list[str]:
+    """Best-effort list of installed Ollama model tags (names)."""
+    global _ollama_models_cache
+    if _ollama_models_cache is not None:
+        return _ollama_models_cache
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=2.0, read=5.0, write=5.0, pool=2.0)) as client:
+            r = await client.get(f"{OLLAMA_URL.rstrip('/')}/api/tags")
+            r.raise_for_status()
+            j = r.json()
+            models: list[str] = []
+            for m in (j.get("models") or []):
+                if isinstance(m, dict) and m.get("name"):
+                    models.append(str(m["name"]))
+            _ollama_models_cache = models
+            return models
+    except Exception:
+        _ollama_models_cache = []
+        return []
+
+
+async def _ollama_choose_model(preferred: str, *, prefer_vision: bool = False) -> tuple[Optional[str], Optional[str]]:
+    """Choose a usable Ollama model; returns (model, warning)."""
+    preferred = (preferred or "").strip()
+    models = await _ollama_list_models()
+    if not models:
+        return None, "[AI] (vision) Ollama has no models available (or is unreachable)."
+
+    if preferred:
+        if preferred in models:
+            return preferred, None
+        prefix = preferred + ":"
+        for m in models:
+            if m.startswith(prefix):
+                return m, f"[AI] (vision) Requested model '{preferred}' not found; using '{m}'."
+
+    if prefer_vision:
+        for m in models:
+            lm = m.lower()
+            if "llava" in lm or "vision" in lm:
+                warn = None
+                if preferred:
+                    warn = f"[AI] (vision) Requested model '{preferred}' not found; using '{m}'."
+                return m, warn
+
+    # Fallback: first available model.
+    warn = None
+    if preferred:
+        warn = f"[AI] (vision) Requested model '{preferred}' not found; using '{models[0]}'."
+    return models[0], warn
+
 
 def _vision_preprocess_jpeg(jpeg_bytes: bytes) -> bytes:
     if not VISION_PREPROCESS:
@@ -172,6 +234,14 @@ def _vision_preprocess_jpeg(jpeg_bytes: bytes) -> bytes:
         from PIL import Image, ImageEnhance, ImageOps
 
         im = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+        if VISION_MAX_SIDE and VISION_MAX_SIDE > 0:
+            w, h = im.size
+            m = max(w, h)
+            if m > VISION_MAX_SIDE:
+                scale = VISION_MAX_SIDE / float(m)
+                nw = max(1, int(w * scale))
+                nh = max(1, int(h * scale))
+                im = im.resize((nw, nh), Image.BILINEAR)
         im = ImageOps.autocontrast(im)
         if abs(VISION_PREPROCESS_BRIGHTNESS - 1.0) > 1e-3:
             im = ImageEnhance.Brightness(im).enhance(VISION_PREPROCESS_BRIGHTNESS)
@@ -268,6 +338,13 @@ async def _viewer_broadcast_loop():
     last_sent_seq = 0
     min_interval = (1.0 / VIEWER_MAX_FPS) if VIEWER_MAX_FPS and VIEWER_MAX_FPS > 0 else 0.0
 
+    async def _safe_send(ws: WebSocket, jpeg: bytes) -> bool:
+        try:
+            await asyncio.wait_for(ws.send_bytes(jpeg), timeout=VIEWER_SEND_TIMEOUT_SEC)
+            return True
+        except Exception:
+            return False
+
     while True:
         if viewer_new_frame_evt is None:
             await asyncio.sleep(0.05)
@@ -290,14 +367,12 @@ async def _viewer_broadcast_loop():
                 await asyncio.sleep(wait)
             _viewer_last_sent_t = time.monotonic()
 
-        dead = []
-        for ws in list(camera_viewers):
-            try:
-                await asyncio.wait_for(ws.send_bytes(jpeg), timeout=VIEWER_SEND_TIMEOUT_SEC)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            camera_viewers.discard(ws)
+        viewers = list(camera_viewers)
+        if viewers:
+            results = await asyncio.gather(*(_safe_send(ws, jpeg) for ws in viewers), return_exceptions=True)
+            for ws, ok in zip(viewers, results):
+                if ok is not True:
+                    camera_viewers.discard(ws)
 
         last_sent_seq = seq
 
@@ -545,17 +620,24 @@ class AgentStepRequest(BaseModel):
 
 
 async def _ollama_describe_image(jpeg_bytes: bytes, prompt: Optional[str] = None) -> str:
-    model = (OLLAMA_VISION_MODEL or OLLAMA_MODEL).strip()
+    requested = (OLLAMA_VISION_MODEL or OLLAMA_MODEL).strip()
+    model, warn = await _ollama_choose_model(requested, prefer_vision=True)
+    if warn:
+        await ui_broadcast_final(warn)
     if not model:
-        raise RuntimeError("OLLAMA model not configured")
+        raise RuntimeError("Ollama not available or has no models")
 
-    user_prompt = (prompt or "请用中文简短描述这张图片里有什么（列出主要物体/场景即可）。").strip()
+    user_prompt = (prompt or "Briefly describe what is in this image (main objects / scene). Use English.").strip()
     jpeg_bytes = _vision_preprocess_jpeg(jpeg_bytes)
     img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
 
     payload = {
         "model": model,
         "stream": False,
+        "options": {
+            "num_predict": OLLAMA_NUM_PREDICT,
+            "temperature": OLLAMA_TEMPERATURE,
+        },
         "messages": [
             {
                 "role": "user",
@@ -565,11 +647,19 @@ async def _ollama_describe_image(jpeg_bytes: bytes, prompt: Optional[str] = None
         ],
     }
 
-    timeout = httpx.Timeout(connect=5.0, read=120.0, write=30.0, pool=5.0)
+    timeout = httpx.Timeout(connect=5.0, read=VISION_OLLAMA_READ_TIMEOUT_SEC, write=30.0, pool=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(f"{OLLAMA_URL.rstrip('/')}/api/chat", json=payload)
+        # Some errors return JSON like {"error": "model ... not found"}
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(str(data.get("error")))
         r.raise_for_status()
-        data = r.json()
+        if data is None:
+            data = r.json()
 
     # Ollama /api/chat returns {"message": {"content": "..."}, ...}
     content = ""
@@ -578,14 +668,14 @@ async def _ollama_describe_image(jpeg_bytes: bytes, prompt: Optional[str] = None
     except Exception:
         content = ""
     content = (content or "").strip()
-    return content or "（没有生成到描述）"
+    return content or "(no description generated)"
 
 
 async def _describe_current_frame(prompt: Optional[str] = None) -> None:
     jpeg: Optional[bytes] = None
     if VISION_DESCRIBE_USE_HQ_SNAPSHOT and esp32_camera_ws is not None:
         try:
-            await ui_broadcast_final("[AI] （vision）正在抓拍高画质画面…")
+            await ui_broadcast_final("[AI] (vision) Capturing a high-quality frame...")
             jpeg = await _esp32_request_hq_snapshot()
         except Exception:
             jpeg = None
@@ -600,13 +690,17 @@ async def _describe_current_frame(prompt: Optional[str] = None) -> None:
     if not jpeg:
         jpeg = viewer_latest_jpeg
     if not jpeg:
-        await ui_broadcast_final("[AI] （vision）当前还没有收到相机画面，无法分析。")
+        await ui_broadcast_final("[AI] (vision) No camera frame received yet; cannot analyze.")
         return
 
-    await ui_broadcast_final("[AI] （vision）正在分析当前画面…")
+    await ui_broadcast_final("[AI] (vision) Analyzing the current frame...")
     try:
         desc = await _ollama_describe_image(jpeg, prompt=prompt)
-        await ui_broadcast_final(f"[AI] （vision）{desc}")
+        await ui_broadcast_final(f"[AI] (vision) {desc}")
+    except httpx.ReadTimeout:
+        await ui_broadcast_final(
+            "[AI] (vision) Timed out waiting for Ollama. On CPU this can be slow; try smaller frames (VISION_MAX_SIDE=512) or increase VISION_OLLAMA_READ_TIMEOUT_SEC."
+        )
     except httpx.HTTPStatusError as e:
         # Often happens when using a non-vision model.
         body = ""
@@ -617,9 +711,10 @@ async def _describe_current_frame(prompt: Optional[str] = None) -> None:
         msg = f"Ollama HTTP {e.response.status_code}"
         if body:
             msg += f": {body[:300]}"
-        await ui_broadcast_final(f"[AI] （vision）分析失败：{msg}")
+        await ui_broadcast_final(f"[AI] (vision) Failed: {msg}")
     except Exception as e:
-        await ui_broadcast_final(f"[AI] （vision）分析失败：{e}")
+        err = str(e).strip() or repr(e)
+        await ui_broadcast_final(f"[AI] (vision) Failed: {err}")
 
 async def full_system_reset(reason: str = ""):
     """
@@ -719,7 +814,11 @@ async def start_ai_with_text_custom(user_text: str):
         # 如果在导航模式或红绿灯检测模式（非CHAT模式）
         if current_state not in ["CHAT", "IDLE"]:
             # 检查是否是允许的对话触发词
-            allowed_keywords = ["帮我看", "帮我看下", "帮我找", "找一下", "看看", "识别一下"]
+            allowed_keywords = [
+                "帮我看", "帮我看下", "帮我找", "找一下", "看看", "识别一下",
+                # 扑克牌识别（专用指令）
+                "扑克牌", "撲克牌", "扑克", "撲克", "看牌", "识别牌", "辨识牌",
+            ]
             is_allowed_query = any(keyword in user_text for keyword in allowed_keywords)
             
             # 检查是否是导航控制命令
@@ -745,11 +844,11 @@ async def start_ai_with_text_custom(user_text: str):
             print(f"[CROSS_STREET] 过马路模式已启动，状态: {orchestrator.get_state()}")
             # 播放启动语音并广播到UI
             play_voice_text("过马路模式已启动。")
-            await ui_broadcast_final("[系统] 过马路模式已启动")
+            await ui_broadcast_final("[SYSTEM] Cross-street mode started")
         else:
             print("[CROSS_STREET] 警告：导航统领器未初始化！")
             play_voice_text("启动过马路模式失败，请稍后重试。")
-            await ui_broadcast_final("[系统] 导航系统未就绪")
+            await ui_broadcast_final("[SYSTEM] Navigation is not ready")
         return
     
     if "过马路结束" in user_text or "结束过马路" in user_text:
@@ -758,9 +857,9 @@ async def start_ai_with_text_custom(user_text: str):
             print(f"[CROSS_STREET] 导航已停止，状态: {orchestrator.get_state()}")
             # 播放停止语音并广播到UI
             play_voice_text("已停止导航。")
-            await ui_broadcast_final("[系统] 过马路模式已停止")
+            await ui_broadcast_final("[SYSTEM] Cross-street mode stopped")
         else:
-            await ui_broadcast_final("[系统] 导航系统未运行")
+            await ui_broadcast_final("[SYSTEM] Navigation is not running")
         return
     
     # 【修改】检查是否是红绿灯检测命令 - 实现与盲道导航互斥
@@ -778,9 +877,9 @@ async def start_ai_with_text_custom(user_text: str):
             trafficlight_detection.reset_detection_state()  # 重置状态
             
             if success:
-                await ui_broadcast_final("[系统] 红绿灯检测已启动")
+                await ui_broadcast_final("[SYSTEM] Traffic light detection started")
             else:
-                await ui_broadcast_final("[系统] 红绿灯模型加载失败")
+                await ui_broadcast_final("[SYSTEM] Failed to load traffic light model")
         except Exception as e:
             print(f"[TRAFFIC] 启动红绿灯检测失败: {e}")
             await ui_broadcast_final(f"[系统] 启动失败: {e}")
@@ -793,7 +892,7 @@ async def start_ai_with_text_custom(user_text: str):
                 orchestrator.stop_navigation()  # 回到CHAT模式
                 print(f"[TRAFFIC] 红绿灯检测停止，恢复到{orchestrator.get_state()}模式")
             
-            await ui_broadcast_final("[系统] 红绿灯检测已停止")
+            await ui_broadcast_final("[SYSTEM] Traffic light detection stopped")
         except Exception as e:
             print(f"[TRAFFIC] 停止红绿灯检测失败: {e}")
             await ui_broadcast_final(f"[系统] 停止失败: {e}")
@@ -809,29 +908,70 @@ async def start_ai_with_text_custom(user_text: str):
         if orchestrator:
             orchestrator.start_blind_path_navigation()
             print(f"[NAVIGATION] 盲道导航已启动，状态: {orchestrator.get_state()}")
-            await ui_broadcast_final("[系统] 盲道导航已启动")
+            await ui_broadcast_final("[SYSTEM] Blind-path navigation started")
         else:
             print("[NAVIGATION] 警告：导航统领器未初始化！")
-            await ui_broadcast_final("[系统] 导航系统未就绪")
+            await ui_broadcast_final("[SYSTEM] Navigation is not ready")
         return
     
     if "停止导航" in user_text or "结束导航" in user_text:
         if orchestrator:
             orchestrator.stop_navigation()
             print(f"[NAVIGATION] 导航已停止，状态: {orchestrator.get_state()}")
-            await ui_broadcast_final("[系统] 盲道导航已停止")
+            await ui_broadcast_final("[SYSTEM] Blind-path navigation stopped")
         else:
-            await ui_broadcast_final("[系统] 导航系统未运行")
+            await ui_broadcast_final("[SYSTEM] Navigation is not running")
         return
 
     nav_cmd_keywords = ["开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航", "立即通过", "现在通过", "继续"]
     if any(k in user_text for k in nav_cmd_keywords):
         if orchestrator:
             orchestrator.on_voice_command(user_text)
-            await ui_broadcast_final("[系统] 导航模式已更新")
+            await ui_broadcast_final("[SYSTEM] Navigation mode updated")
         else:
-            await ui_broadcast_final("[系统] 导航统领器未初始化")
+            await ui_broadcast_final("[SYSTEM] Navigation orchestrator not initialized")
         return    
+
+    # ===== 扑克牌识别（专用） =====
+    card_keywords = ["扑克牌", "撲克牌", "扑克", "撲克", "看牌", "识别牌", "辨识牌"]
+    is_card_intent = any(k in user_text for k in card_keywords)
+
+    # 停止扑克牌识别
+    if is_card_intent and ("停止" in user_text or "结束" in user_text or "关闭" in user_text):
+        if yolomedia_running:
+            stop_yolomedia()
+        if orchestrator:
+            orchestrator.stop_item_search(restore_nav=True)
+        await ui_broadcast_final("[SYSTEM] Cards recognition stopped")
+        return
+
+    # 启动扑克牌识别
+    if is_card_intent and (
+        "识别" in user_text
+        or "識別" in user_text
+        or "辨识" in user_text
+        or "辨識" in user_text
+        or "检测" in user_text
+        or "開始" in user_text
+        or "开始" in user_text
+        or "看" in user_text
+        or (user_text.strip() in card_keywords)
+    ):
+        # 与其他模式互斥：先停掉当前找物品流程
+        if yolomedia_running:
+            stop_yolomedia()
+        if orchestrator:
+            orchestrator.start_item_search()
+            print(f"[CARDS] 已切换到找物品模式（用于扑克牌识别），状态: {orchestrator.get_state()}")
+
+        # 传入一个特殊 target，yolomedia 会识别并切到 cards mode
+        start_yolomedia_with_target("cards")
+        try:
+            play_voice_text("已启动扑克牌识别。")
+        except Exception:
+            pass
+        await ui_broadcast_final("[SYSTEM] Cards recognition started")
+        return
 
     # 检查是否是"帮我找/识别一下xxx"的命令
     # 扩展正则表达式，支持更多关键词
@@ -856,7 +996,7 @@ async def start_ai_with_text_custom(user_text: str):
 
             # 给前端/语音来个确认反馈
             try:
-                await ui_broadcast_final(f"[找物品] 正在寻找 {item_cn}...")
+                await ui_broadcast_final(f"[FINDER] Looking for {item_cn}...")
             except Exception:
                 pass
 
@@ -876,11 +1016,11 @@ async def start_ai_with_text_custom(user_text: str):
             
             # 根据恢复的状态给出反馈
             if current_state in ["BLINDPATH_NAV", "SEEKING_CROSSWALK", "WAIT_TRAFFIC_LIGHT", "CROSSING", "SEEKING_NEXT_BLINDPATH"]:
-                await ui_broadcast_final("[找物品] 已找到物品，继续导航。")
+                await ui_broadcast_final("[FINDER] Item found. Resuming navigation.")
             else:
-                await ui_broadcast_final("[找物品] 已找到物品。")
+                await ui_broadcast_final("[FINDER] Item found.")
         else:
-            await ui_broadcast_final("[找物品] 已找到物品。")
+            await ui_broadcast_final("[FINDER] Item found.")
         
         return
     
@@ -1284,10 +1424,18 @@ async def ws_camera_esp(ws: WebSocket):
     frame_counter = 0  # 添加帧计数器
     t0 = time.monotonic()
     last_log_t = t0
+    last_rx_t = time.monotonic()
     
     try:
         while True:
-            msg = await ws.receive()
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=ESP32_CAMERA_RX_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                # ESP32 sometimes stays connected but stops sending; force reconnect.
+                stall_s = time.monotonic() - last_rx_t
+                print(f"[CAMERA] stalled: no frames for {stall_s:.1f}s; closing for reconnect", flush=True)
+                break
+
             if "text" in msg and msg["text"] is not None:
                 t = (msg["text"] or "").strip()
                 if t == "SNAP:BEGIN":
@@ -1308,6 +1456,7 @@ async def ws_camera_esp(ws: WebSocket):
 
             if "bytes" in msg and msg["bytes"] is not None:
                 data = msg["bytes"]
+                last_rx_t = time.monotonic()
 
                 # If we're in a SNAP:HQ window, capture this JPEG as the snapshot.
                 if _esp32_snapshot_active:
@@ -1501,6 +1650,15 @@ async def ws_camera_esp(ws: WebSocket):
 @app.websocket("/ws/viewer")
 async def ws_viewer(ws: WebSocket):
     await ws.accept()
+
+    # Optional guardrail: too many viewer sockets can stall broadcast and look like a frozen camera.
+    if VIEWER_MAX_CLIENTS and VIEWER_MAX_CLIENTS > 0 and len(camera_viewers) >= VIEWER_MAX_CLIENTS:
+        try:
+            await ws.close(code=1013)
+        except Exception:
+            pass
+        return
+
     camera_viewers.add(ws)
     print(f"[VIEWER] Browser connected. Total viewers: {len(camera_viewers)}", flush=True)
     try:
@@ -1508,12 +1666,19 @@ async def ws_viewer(ws: WebSocket):
             await asyncio.wait_for(ws.send_bytes(viewer_latest_jpeg), timeout=VIEWER_SEND_TIMEOUT_SEC)
     except Exception:
         pass
+    # Keepalive: periodically send the latest frame (if any) so dead sockets are pruned
+    # even when the camera stream stalls.
     try:
         while True:
-            # 保持连接活跃
-            await asyncio.sleep(60)
+            await asyncio.sleep(15)
+            jpeg = viewer_latest_jpeg
+            if jpeg:
+                try:
+                    await asyncio.wait_for(ws.send_bytes(jpeg), timeout=VIEWER_SEND_TIMEOUT_SEC)
+                except Exception:
+                    break
     except WebSocketDisconnect:
-        print("[VIEWER] Browser disconnected", flush=True)
+        pass
     finally:
         try: 
             camera_viewers.remove(ws)
