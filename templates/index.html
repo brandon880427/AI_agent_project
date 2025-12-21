@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ESP32 Camera Viewer</title>
+<style>
+  :root{
+    --bg:#0b0f14; --card:#121821; --text:#e6edf3; --muted:#9fb0c3;
+    --ok:#7ee787; --err:#ff8080; --line:#1f2937; --panel:rgba(18,24,33,.65);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:linear-gradient(180deg,#0b0f14,#0b0f14 60%,#0e1621);
+    color:var(--text);
+    font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,"Noto Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei",Arial;
+  }
+
+  .app{display:grid; grid-template-columns: 1fr 520px; gap:16px; height:100vh; padding:16px}
+  .stage{position:relative; height:100%; border:1px solid var(--line); border-radius:14px; background:#0a1017; overflow:hidden;}
+  #canvas{position:absolute; inset:0; width:100%; height:100%; display:block; background:#000}
+
+  .side{display:flex; flex-direction:column; border:1px solid var(--line); border-radius:14px; background:var(--card); overflow:hidden}
+  .top{display:flex; align-items:center; justify-content:space-between; gap:10px; padding:12px 14px; border-bottom:1px solid var(--line)}
+  .badges{display:flex; gap:10px; flex-wrap:wrap}
+  .badge{font-size:12px;padding:4px 8px;border-radius:999px;border:1px solid #2d3b50;color:var(--muted)}
+  .ok{color:var(--ok);border-color:var(--ok)} .err{color:var(--err);border-color:var(--err)}
+  .controls{display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end}
+  button{background:#1f6feb;border:1px solid #1f6feb;color:#fff;border-radius:10px;padding:8px 12px;font-weight:600;cursor:pointer}
+  .ghost{background:transparent;border-color:#304057;color:#9fb0c3}
+
+  #chatContainer{flex:1; min-height:0; overflow:auto; padding:12px; background:#0b1020}
+  .msg{margin:8px 0; display:flex}
+  .msg.ai{justify-content:flex-start}
+  .msg.user{justify-content:flex-end}
+  .bubble{max-width:82%; padding:10px 12px; border-radius:14px; border:1px solid #1f2937; white-space:pre-wrap; word-break:break-word}
+  .msg.ai .bubble{background:#111a2e}
+  .msg.user .bubble{background:#2a6df4; border-color:#2a6df4}
+
+  @media (max-width:1100px){
+    .app{grid-template-columns:1fr; height:auto}
+    .stage{height:60vh}
+    .side{height:50vh}
+  }
+</style>
+</head>
+<body>
+
+<div class="app">
+  <section class="stage">
+    <canvas id="canvas"></canvas>
+  </section>
+
+  <aside class="side">
+    <div class="top">
+      <div class="badges">
+        <span id="camStatus" class="badge">Camera: connecting…</span>
+        <span id="uiStatus" class="badge">UI: connecting…</span>
+        <span id="agentStatus" class="badge">Agent: --</span>
+        <span id="fps" class="badge">FPS: --</span>
+      </div>
+      <div class="controls">
+        <button class="ghost" id="btnReconnect">Reconnect</button>
+        <button class="ghost" id="btnClear">Clear</button>
+        <button id="btnDescribe">Describe</button>
+        <button class="ghost" id="btnAgentStep">Agent Step</button>
+        <button class="ghost" id="btnAgentStart">Agent Start</button>
+        <button class="ghost" id="btnAgentStop">Agent Stop</button>
+      </div>
+    </div>
+
+    <div id="chatContainer"></div>
+  </aside>
+</div>
+
+<!-- 主脚本 -->
+<script type="module" src="/static/main_lite.js?v=20251220-lite2"></script>
+</body>
+</html>

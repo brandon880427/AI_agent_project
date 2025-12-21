@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+
+# Local env/secrets
+.env
+compile/secrets.h
+
+# Runtime artifacts
+server.pid
+server.out
+server_bg.log
+server.log
+
+# Logs
+*.log
+
+# ESP32 / PlatformIO artifacts
+.pio/
+.pio_upload/
+esp32_*.log
+esp32_*.pid
+
+# Recordings / generated media
+recordings/
+
+# Model weights (download separately)
+model/*.pt
+model/*.pth
+model/*.onnx
+model/*.engine
+
+# OS
+.DS_Store
