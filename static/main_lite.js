@@ -1,18 +1,15 @@
 // static/main_lite.js (lite UI)
 
 (() => {
+  const UI_VERSION = 'lite5';
   const $camStatus = document.getElementById('camStatus');
   const $uiStatus = document.getElementById('uiStatus');
-  const $agentStatus = document.getElementById('agentStatus');
   const $fps = document.getElementById('fps');
 
   const $btnReconnect = document.getElementById('btnReconnect');
   const $btnClear = document.getElementById('btnClear');
   const $btnDescribe = document.getElementById('btnDescribe');
   const $btnCards = document.getElementById('btnCards');
-  const $btnAgentStep = document.getElementById('btnAgentStep');
-  const $btnAgentStart = document.getElementById('btnAgentStart');
-  const $btnAgentStop = document.getElementById('btnAgentStop');
 
   const $chat = document.getElementById('chatContainer');
 
@@ -62,7 +59,14 @@
   let camRetry = 0;
   let lastFrameAt = 0;
   let stallTimer = null;
-  const STALL_MS = 3500;
+  // The backend keepalive sends the latest frame every ~15s even when the camera stalls.
+  // Using a too-small stall timeout causes endless reconnect flapping and looks like
+  // an unstable connection. Keep this comfortably above server keepalive.
+  const STALL_MS = 25000;
+
+  let sawFirstFrame = false;
+
+  let waitingHintTimer = null;
 
   let frameCount = 0;
   let lastFpsT = performance.now();
@@ -70,35 +74,133 @@
   // Draw backpressure: keep-latest + rAF draw to avoid latency from queued frames.
   let pendingBuf = null;
   let drawScheduled = false;
+  let totalFrames = 0;
+  let lastFrameBytes = 0;
+
+  function drawDiag(lines) {
+    try {
+      fitCanvas();
+      const rect = canvas.getBoundingClientRect();
+      const w = Math.max(1, rect.width);
+      const h = Math.max(1, rect.height);
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, w, h);
+      ctx.fillStyle = '#ff8080';
+      ctx.font = '14px system-ui, -apple-system, Segoe UI, Roboto, Arial';
+      const arr = Array.isArray(lines) ? lines : [String(lines)];
+      let y = 24;
+      for (const s of arr) {
+        ctx.fillText(String(s), 16, y);
+        y += 18;
+      }
+    } catch (e) {}
+  }
   async function _drawPending() {
     drawScheduled = false;
     const buf = pendingBuf;
     pendingBuf = null;
     if (!(buf instanceof ArrayBuffer)) return;
 
+    totalFrames++;
+    lastFrameBytes = buf.byteLength || 0;
+    if ($camStatus) {
+      // Keep it short; user just needs proof frames arrive.
+      $camStatus.textContent = `Camera: streaming (${totalFrames}, ${lastFrameBytes}B)`;
+      $camStatus.className = 'badge ok';
+    }
+
+    // Quick JPEG magic check (FFD8) + required markers (SOF/SOS).
+    try {
+      const u8 = new Uint8Array(buf);
+      if (u8.length < 4 || u8[0] !== 0xff || u8[1] !== 0xd8) {
+        const head = Array.from(u8.slice(0, 8)).map(x => x.toString(16).padStart(2,'0')).join(' ');
+        drawDiag([
+          'No image drawn',
+          `Reason: non-JPEG frame (len=${u8.length})`,
+          `Head: ${head}`,
+        ]);
+        return;
+      }
+
+      // Many "black screen" reports are actually invalid JPEG streams from the device.
+      // A decodable JPEG should contain SOF (FFC0/FFC2) and SOS (FFDA).
+      const has = (a, b) => {
+        for (let i = 0; i + 1 < u8.length; i++) {
+          if (u8[i] === a && u8[i + 1] === b) return true;
+        }
+        return false;
+      };
+      const hasSOF = has(0xff, 0xc0) || has(0xff, 0xc2);
+      const hasSOS = has(0xff, 0xda);
+      // Also require quantization + Huffman tables; missing tables often decode-fail.
+      const hasDQT = has(0xff, 0xdb);
+      const hasDHT = has(0xff, 0xc4);
+      if (!hasSOF || !hasSOS || !hasDQT || !hasDHT) {
+        const missing = [
+          !hasSOF ? 'SOF' : null,
+          !hasSOS ? 'SOS' : null,
+          !hasDQT ? 'DQT' : null,
+          !hasDHT ? 'DHT' : null,
+        ].filter(Boolean).join('+');
+        drawDiag([
+          'No image drawn',
+          `Reason: invalid JPEG (missing ${missing})`,
+          `len=${u8.length}B`,
+          'Fix: ESP32 camera must send full JPEG frames',
+        ]);
+        return;
+      }
+    } catch (e) {}
+
     fitCanvas();
     const blob = new Blob([buf], { type: 'image/jpeg' });
-    try {
-      const rect = canvas.getBoundingClientRect();
-      const w = Math.max(1, rect.width);
-      const h = Math.max(1, rect.height);
+    const rect = canvas.getBoundingClientRect();
+    const w = Math.max(1, rect.width);
+    const h = Math.max(1, rect.height);
 
-      if ('createImageBitmap' in window) {
+    // Safari can have createImageBitmap() but fail decoding certain blobs;
+    // also some browsers still deliver WS frames as Blob despite binaryType.
+    // Always provide a resilient fallback path.
+    let drew = false;
+    if ('createImageBitmap' in window) {
+      try {
         const bmp = await createImageBitmap(blob);
         ctx.clearRect(0, 0, w, h);
         ctx.drawImage(bmp, 0, 0, w, h);
         try { bmp.close(); } catch (e) {}
-      } else {
+        drew = true;
+      } catch (e) {
+        // fall through to <img> decode
+      }
+    }
+
+    if (!drew) {
+      const url = URL.createObjectURL(blob);
+      try {
         const img = new Image();
-        img.onload = () => {
+        img.src = url;
+        if (img.decode) {
+          await img.decode();
           ctx.clearRect(0, 0, w, h);
           ctx.drawImage(img, 0, 0, w, h);
-          try { URL.revokeObjectURL(img.src); } catch (e) {}
-        };
-        img.src = URL.createObjectURL(blob);
+        } else {
+          await new Promise((resolve, reject) => {
+            img.onload = () => resolve();
+            img.onerror = () => reject(new Error('img decode failed'));
+          });
+          ctx.clearRect(0, 0, w, h);
+          ctx.drawImage(img, 0, 0, w, h);
+        }
+      } catch (e) {
+        drawDiag([
+          'No image drawn',
+          'Reason: JPEG decode failed',
+          `len=${buf.byteLength || 0}B`,
+        ]);
+      } finally {
+        try { URL.revokeObjectURL(url); } catch (e) {}
       }
-    } catch (e) {
-      // ignore decode/draw errors
     }
 
     // If a newer frame arrived while drawing, schedule another draw.
@@ -119,7 +221,7 @@
 
   function connectCamera() {
     try { if (camWs) camWs.close(); } catch (e) {}
-    setBadge($camStatus, false, 'Camera: connecting…');
+    setBadge($camStatus, false, `Camera: connecting… (${UI_VERSION})`);
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     camWs = new WebSocket(`${proto}://${location.host}/ws/viewer`);
@@ -127,24 +229,58 @@
 
     camWs.onopen = () => {
       camRetry = 0;
-      setBadge($camStatus, true, 'Camera: connected');
+      setBadge($camStatus, true, 'Camera: connected (waiting for frames…)');
       lastFrameAt = performance.now();
+
+      // If no frames arrive shortly after connect, show an on-canvas hint.
+      if (waitingHintTimer) {
+        try { clearTimeout(waitingHintTimer); } catch (e) {}
+      }
+      waitingHintTimer = setTimeout(() => {
+        if (!sawFirstFrame) {
+          drawDiag([
+            'Waiting for camera frames…',
+            'If this stays, check /api/camera/debug and /api/camera/last.jpg',
+          ]);
+        }
+      }, 2000);
 
       if (stallTimer) {
         try { clearInterval(stallTimer); } catch (e) {}
       }
       stallTimer = setInterval(() => {
         if (!lastFrameAt) return;
+        // Do not flap the connection before the first frame.
+        if (!sawFirstFrame) return;
         if (performance.now() - lastFrameAt > STALL_MS) {
-          setBadge($camStatus, false, 'Camera: stalled; reconnecting…');
-          try { camWs.close(); } catch (e) {}
+          // Show stall but keep socket; backend keepalive may still deliver frames.
+          setBadge($camStatus, false, 'Camera: stalled (no new frames)');
         }
       }, 500);
     };
 
     camWs.onmessage = async (ev) => {
       lastFrameAt = performance.now();
-      enqueueFrame(ev.data);
+      if (!sawFirstFrame) {
+        sawFirstFrame = true;
+        setBadge($camStatus, true, 'Camera: streaming');
+      }
+
+      if (waitingHintTimer) {
+        try { clearTimeout(waitingHintTimer); } catch (e) {}
+        waitingHintTimer = null;
+      }
+      // Some browsers (esp. Safari) may still provide Blob even if binaryType='arraybuffer'.
+      if (ev.data instanceof ArrayBuffer) {
+        enqueueFrame(ev.data);
+      } else if (ev.data instanceof Blob) {
+        try {
+          const ab = await ev.data.arrayBuffer();
+          enqueueFrame(ab);
+        } catch (e) {
+          // ignore
+        }
+      }
 
       frameCount++;
       const now = performance.now();
@@ -159,6 +295,11 @@
     camWs.onclose = () => {
       setBadge($camStatus, false, 'Camera: disconnected');
       lastFrameAt = 0;
+      sawFirstFrame = false;
+      if (waitingHintTimer) {
+        try { clearTimeout(waitingHintTimer); } catch (e) {}
+        waitingHintTimer = null;
+      }
       if (stallTimer) {
         try { clearInterval(stallTimer); } catch (e) {}
         stallTimer = null;
@@ -179,7 +320,7 @@
 
   function connectUi() {
     try { if (uiWs) uiWs.close(); } catch (e) {}
-    setBadge($uiStatus, false, 'UI: connecting…');
+    setBadge($uiStatus, false, `UI: connecting… (${UI_VERSION})`);
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     uiWs = new WebSocket(`${proto}://${location.host}/ws_ui`);
@@ -213,22 +354,6 @@
     };
   }
 
-  // ===== Agent controls =====
-  async function refreshAgentStatus() {
-    try {
-      const r = await fetch('/api/agent/status', { cache: 'no-store' });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const j = await r.json();
-      const running = !!j.running;
-      setBadge($agentStatus, running, `Agent: ${running ? 'running' : 'stopped'}`);
-    } catch (e) {
-      setBadge($agentStatus, false, 'Agent: unavailable');
-    }
-  }
-
-  setInterval(refreshAgentStatus, 2000);
-  refreshAgentStatus();
-
   async function postJson(url, body) {
     const r = await fetch(url, {
       method: 'POST',
@@ -239,72 +364,9 @@
     return await r.json();
   }
 
-  async function sendPromptWsAudio(promptText) {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${proto}://${location.host}/ws_audio`;
-    return await new Promise((resolve, reject) => {
-      let done = false;
-      let ws;
-      try {
-        ws = new WebSocket(url);
-      } catch (e) {
-        reject(e);
-        return;
-      }
-
-      const timeout = setTimeout(() => {
-        if (done) return;
-        done = true;
-        try { ws.close(); } catch (e) {}
-        reject(new Error('ws_audio timeout'));
-      }, 2000);
-
-      ws.onopen = () => {
-        try {
-          ws.send(`PROMPT:${promptText}`);
-        } catch (e) {
-          clearTimeout(timeout);
-          if (!done) {
-            done = true;
-            try { ws.close(); } catch (e2) {}
-            reject(e);
-          }
-        }
-      };
-
-      ws.onmessage = (ev) => {
-        const msg = String(ev.data || '');
-        if (done) return;
-        if (msg.startsWith('OK:')) {
-          done = true;
-          clearTimeout(timeout);
-          try { ws.close(); } catch (e) {}
-          resolve(msg);
-        }
-      };
-
-      ws.onerror = () => {
-        if (done) return;
-        done = true;
-        clearTimeout(timeout);
-        try { ws.close(); } catch (e) {}
-        reject(new Error('ws_audio error'));
-      };
-
-      ws.onclose = () => {
-        if (done) return;
-        // If closed without OK, treat as failure.
-        done = true;
-        clearTimeout(timeout);
-        reject(new Error('ws_audio closed'));
-      };
-    });
-  }
-
   $btnReconnect?.addEventListener('click', () => {
     connectCamera();
     connectUi();
-    refreshAgentStatus();
   });
 
   $btnClear?.addEventListener('click', () => {
@@ -330,39 +392,9 @@
   $btnCards?.addEventListener('click', async () => {
     addMessage('[UI] cards mode requested', true);
     try {
-      await sendPromptWsAudio('cards');
+      await postJson('/api/cards/start', {});
     } catch (e) {
       addMessage(`[UI] cards mode failed: ${e}`);
-    }
-  });
-
-  $btnAgentStart?.addEventListener('click', async () => {
-    addMessage('[UI] agent start', true);
-    try {
-      await postJson('/api/agent/start', {});
-      await refreshAgentStatus();
-    } catch (e) {
-      addMessage(`[UI] agent start failed: ${e}`);
-    }
-  });
-
-  $btnAgentStop?.addEventListener('click', async () => {
-    addMessage('[UI] agent stop', true);
-    try {
-      await postJson('/api/agent/stop', {});
-      await refreshAgentStatus();
-    } catch (e) {
-      addMessage(`[UI] agent stop failed: ${e}`);
-    }
-  });
-
-  $btnAgentStep?.addEventListener('click', async () => {
-    addMessage('[UI] agent step', true);
-    try {
-      await postJson('/api/agent/step', {});
-      await refreshAgentStatus();
-    } catch (e) {
-      addMessage(`[UI] agent step failed: ${e}`);
     }
   });
 

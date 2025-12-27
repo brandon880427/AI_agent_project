@@ -20,9 +20,7 @@ torchvision==0.15.2
 mediapipe==0.10.8
 
 # Audio Processing
-pyaudio==0.2.14
-pydub==0.25.1
-pygame==2.5.2
+# (Removed in minimal build)
 
 # Aliyun DashScope SDK (ASR & Qwen-Omni)
 dashscope==1.14.1

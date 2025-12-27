@@ -1,8 +1,14 @@
 # qwen_extractor.py
 # -*- coding: utf-8 -*-
-from typing import List, Tuple
+from __future__ import annotations
+
+from typing import Tuple
 import os
-from openai import OpenAI
+
+try:
+    from openai import OpenAI
+except Exception:  # openai is optional in LITE mode
+    OpenAI = None  # type: ignore[assignment]
 
 # —— 本地优先映射（可随时扩充/改名）——
 LOCAL_CN2EN = {
@@ -20,7 +26,16 @@ LOCAL_CN2EN = {
 def _make_client() -> OpenAI:
     # 复用你百炼兼容端点；支持从环境变量读取
     base_url = os.getenv("DASHSCOPE_COMPAT_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    api_key  = "sk-a9440db694924559ae4ebdc2023d2b9a"
+    api_key = (
+        os.getenv("DASHSCOPE_API_KEY")
+        or os.getenv("QWEN_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
+
+    if OpenAI is None:
+        raise RuntimeError("Optional dependency missing: pip install openai")
+    if not api_key:
+        raise RuntimeError("Missing DASHSCOPE_API_KEY/QWEN_API_KEY/OPENAI_API_KEY")
     return OpenAI(api_key=api_key, base_url=base_url)
 
 PROMPT_SYS = (

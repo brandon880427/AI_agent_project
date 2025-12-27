@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # flash_esp32.sh
-# Usage: ./scripts/flash_esp32.sh [--port /dev/tty.XYZ] [--board ai-thinker|xiao-s3|esp32dev] [--monitor]
+# Usage: ./scripts/flash_esp32.sh [--port /dev/tty.XYZ] [--board ai-thinker|xiao-s3|xiao-s3-nopsram|esp32dev] [--monitor]
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$REPO_ROOT/.pio_upload"
@@ -15,7 +15,7 @@ MONITOR=false
 
 print_usage(){
   cat <<EOF
-Usage: $0 [--port /dev/cu.usbserial-XXXX] [--board ai-thinker|xiao-s3|esp32dev] [--monitor]
+Usage: $0 [--port /dev/cu.usbserial-XXXX] [--board ai-thinker|xiao-s3|xiao-s3-nopsram|esp32dev] [--monitor]
 
 This script will:
   - Create a temporary PlatformIO project in .pio_upload/
@@ -26,7 +26,7 @@ This script will:
 Options:
   --port    Serial port to upload to (e.g. /dev/cu.SLAB_USBtoUART). If omitted,
             the script will try to auto-detect the most recently added port.
-  --board   Target board (default: ai-thinker). Supported: ai-thinker, xiao-s3, esp32dev
+  --board   Target board (default: ai-thinker). Supported: ai-thinker, xiao-s3, xiao-s3-nopsram, esp32dev
   --monitor Start serial monitor after upload (baud 115200)
   --help    Show this message
 EOF
@@ -128,6 +128,15 @@ monitor_speed = 115200
 lib_deps =
   gilmaimon/ArduinoWebsockets
 
+[env:xiao-s3-nopsram]
+platform = espressif32
+; ESP32-S3 without PSRAM (prevents boot loops on boards that do not have PSRAM wired)
+board = esp32-s3-devkitc-1
+framework = arduino
+monitor_speed = 115200
+lib_deps =
+  gilmaimon/ArduinoWebsockets
+
 [env:esp32dev]
 platform = espressif32
 board = esp32dev
@@ -168,6 +177,7 @@ fi
 case "$BOARD" in
   ai-thinker) ENV=ai-thinker;;
   xiao-s3) ENV=xiao-s3;;
+  xiao-s3-nopsram) ENV=xiao-s3-nopsram;;
   esp32dev) ENV=esp32dev;;
   *) echo "Unknown board: $BOARD"; exit 1;;
 esac

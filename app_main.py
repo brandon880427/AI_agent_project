@@ -1,36 +1,31 @@
 # app_main.py
 # -*- coding: utf-8 -*-
-import os, sys, time, json, asyncio, base64, audioop, io
-from typing import Any, Dict, Optional, Tuple, List, Callable, Set, Deque
+import os, sys, time, json, asyncio, base64, io
+import binascii
+from typing import Any, Dict, Optional, Tuple, List, Set, Deque
 from collections import deque
-from dataclasses import dataclass
-import re
-# 在其它 import 之后加：
-from qwen_extractor import extract_english_label
-from navigation_master import NavigationMaster, OrchestratorResult 
-# 新增：导入盲道导航器
-from workflow_blindpath import BlindPathNavigator
-# 新增：导入过马路导航器
-from workflow_crossstreet import CrossStreetNavigator
-import torch
+"""Main web app.
+
+This project is intentionally kept minimal:
+- ESP32 camera stream in via /ws/camera
+- Browser viewers via /ws/viewer
+- Poker cards detection (YOLO) via /api/cards/start
+- Send current frame to LLM via /api/describe
+"""
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from pydantic import BaseModel
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
 import uvicorn
 import cv2
 import numpy as np
-from ultralytics import YOLO
-from obstacle_detector_client import ObstacleDetectorClient
-
-import torch  # 添加这行
-
-
-import mediapipe as mp
 import bridge_io
 import threading
-import yolomedia  # 确保和 app_main.py 同目录，文件名就是 yolomedia.py
+try:
+    import yolomedia  # 确保和 app_main.py 同目录，文件名就是 yolomedia.py
+except Exception:
+    yolomedia = None  # optional; requires mediapipe/ultralytics
 # ---- Windows 事件循环策略 ----
 if sys.platform.startswith("win"):
     try:
@@ -45,83 +40,27 @@ try:
 except Exception:
     pass
 
-# ---- External service config ----
-# Note: LLM provider switched to Ollama (local LLM). Ollama runs by default at http://localhost:11434
-# DashScope ASR integration (dashscope.audio) is left as-is for projects that still use it.
-try:
-    from dashscope import audio as dash_audio  # optional, will fail if not installed
-except Exception:
-    dash_audio = None
-
 # LLM (Ollama) settings
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama2")
 OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava:latest")  # e.g. llava:latest / llama3.2-vision
 
-# ASR model name (if using DashScope ASR)
-MODEL = os.getenv("DASHSCOPE_ASR_MODEL", "paraformer-realtime-v2")
-# DashScope API key (kept for backward compatibility with DashScope ASR). May be empty.
-API_KEY = os.getenv("DASHSCOPE_API_KEY")
-SAMPLE_RATE  = 16000
-AUDIO_FMT    = "pcm"
-CHUNK_MS     = 20
-BYTES_CHUNK  = SAMPLE_RATE * CHUNK_MS // 1000 * 2
-SILENCE_20MS = bytes(BYTES_CHUNK)
-
-# ---- 引入我们的模块 ----
-from audio_stream import (
-    register_stream_route,         # 挂 /stream.wav
-    broadcast_pcm16_realtime,      # 实时向连接分发 16k PCM
-    hard_reset_audio,              # 音频+AI 播放总闸
-    BYTES_PER_20MS_16K,
-    is_playing_now,
-    current_ai_task,
-)
-from omni_client import stream_chat, OmniStreamPiece
-from asr_core import (
-    ASRCallback,
-    set_current_recognition,
-    stop_current_recognition,
-)
-from audio_player import initialize_audio_system, play_voice_text
-
-# ---- 同步录制器 ----
-import sync_recorder
-import signal
-import atexit
-
 # HTTP client for Ollama (async)
 import httpx
 
-# Vision agent (llava via Ollama)
-from vision_agent import VisionAgent
-
-# ---- IMU UDP ----
-# Allow overriding UDP port via environment for flexible runs
-UDP_IP   = os.getenv("UDP_IP", "0.0.0.0")
-UDP_PORT = int(os.getenv("UDP_PORT", "12345"))
-
-# ---- Lite mode (disable unused heavy features by default) ----
-LITE_MODE = os.getenv("LITE_MODE", "1") != "0"
-ENABLE_RECORDER = os.getenv("ENABLE_RECORDER", "0" if LITE_MODE else "1") != "0"
-ENABLE_AUDIO_SYSTEM = os.getenv("ENABLE_AUDIO_SYSTEM", "0" if LITE_MODE else "1") != "0"
-ENABLE_NAV_MODELS = os.getenv("ENABLE_NAV_MODELS", "0" if LITE_MODE else "1") != "0"
-ENABLE_TRAFFIC_LIGHT = os.getenv("ENABLE_TRAFFIC_LIGHT", "0" if LITE_MODE else "1") != "0"
-ENABLE_UDP = os.getenv("ENABLE_UDP", "0" if LITE_MODE else "1") != "0"
-AGENT_AUTOSTART = os.getenv("AGENT_AUTOSTART", "0") != "0"
-
 # ---- Camera streaming knobs (env) ----
-# Keep defaults matching current behavior as much as possible.
-RECORDER_AUTOSTART = os.getenv("RECORDER_AUTOSTART", "0" if LITE_MODE else "1") != "0"
-CAMERA_RECORD_ENABLED = os.getenv("CAMERA_RECORD_ENABLED", "0" if LITE_MODE else "1") != "0"
 VIEWER_SEND_RAW_JPEG = os.getenv("VIEWER_SEND_RAW_JPEG", "1") != "0"  # if possible, forward ESP32 JPEG directly
 VIEWER_MAX_FPS = float(os.getenv("VIEWER_MAX_FPS", "12"))  # global cap; 0 disables
 VIEWER_SEND_TIMEOUT_SEC = float(os.getenv("VIEWER_SEND_TIMEOUT_SEC", "0.25"))
 VIEWER_MAX_CLIENTS = int(os.getenv("VIEWER_MAX_CLIENTS", "8"))  # 0 disables cap
-CAMERA_PROFILE = os.getenv("CAMERA_PROFILE", "0") != "0"  # print per-stage timings periodically
 
 # If ESP32 camera socket stays connected but stops sending frames, force reconnect.
-ESP32_CAMERA_RX_TIMEOUT_SEC = float(os.getenv("ESP32_CAMERA_RX_TIMEOUT_SEC", "8"))
+# Default is intentionally relaxed to avoid flapping on slow startups.
+ESP32_CAMERA_RX_TIMEOUT_SEC = float(os.getenv("ESP32_CAMERA_RX_TIMEOUT_SEC", "30"))
+
+# If we keep receiving WS messages (e.g. keepalive text) but no actual JPEG frames,
+# the UI will appear frozen. Force a reconnect when frames stall.
+ESP32_CAMERA_FRAME_TIMEOUT_SEC = float(os.getenv("ESP32_CAMERA_FRAME_TIMEOUT_SEC", "15"))
 
 app = FastAPI()
 
@@ -136,11 +75,24 @@ last_frames: Deque[Tuple[float, bytes]] = deque(maxlen=10)
 
 camera_viewers: Set[WebSocket] = set()
 esp32_camera_ws: Optional[WebSocket] = None
-imu_ws_clients: Set[WebSocket] = set()
-esp32_audio_ws: Optional[WebSocket] = None
+
+# --- Camera RX debug counters (helps diagnose black screen) ---
+camera_rx_connected: bool = False
+camera_rx_connected_at: float = 0.0
+camera_rx_msg_count: int = 0
+camera_rx_text_count: int = 0
+camera_rx_bytes_count: int = 0
+camera_rx_last_msg_t: float = 0.0
+camera_rx_last_frame_t: float = 0.0
+camera_rx_last_frame_size: int = 0
+camera_rx_invalid_jpeg_count: int = 0
+camera_rx_last_invalid_jpeg_reason: Optional[str] = None
+camera_rx_last_text: Optional[str] = None
+camera_rx_last_text_t: float = 0.0
 
 # ===== ESP32 camera tuning (server -> ESP32 over /ws/camera) =====
 # Firmware supports: SET:FRAMESIZE=QVGA/VGA/SVGA/XGA, SET:QUALITY=5..40, SET:FPS=0/5..60
+ESP32_SEND_CAMERA_TUNING = os.getenv("ESP32_SEND_CAMERA_TUNING", "0") != "0"
 ESP32_STREAM_FRAMESIZE = os.getenv("ESP32_STREAM_FRAMESIZE", "VGA").strip().upper()
 ESP32_STREAM_QUALITY = int(os.getenv("ESP32_STREAM_QUALITY", "12"))
 ESP32_STREAM_FPS = int(os.getenv("ESP32_STREAM_FPS", "12"))
@@ -165,6 +117,7 @@ _esp32_snapshot_evt: Optional[asyncio.Event] = None
 # Viewer broadcast: keep only the newest frame (avoid backlog / eventual freeze)
 viewer_latest_jpeg: Optional[bytes] = None
 viewer_latest_seq: int = 0
+viewer_latest_t: float = 0.0
 viewer_new_frame_evt: Optional[asyncio.Event] = None
 viewer_broadcast_task: Optional[asyncio.Task] = None
 _viewer_last_sent_t: float = 0.0
@@ -290,42 +243,14 @@ async def _esp32_request_hq_snapshot() -> Optional[bytes]:
 
     return _esp32_last_snapshot_jpeg
 
-# Vision agent runtime state
-_vision_agent: Optional[VisionAgent] = None
-
-
-def _get_latest_jpeg_for_agent() -> Optional[bytes]:
-    jpeg: Optional[bytes] = None
-    try:
-        if last_frames:
-            jpeg = last_frames[-1][1]
-    except Exception:
-        jpeg = None
-    if not jpeg:
-        jpeg = viewer_latest_jpeg
-    return jpeg
-
-
-def _ensure_vision_agent() -> VisionAgent:
-    global _vision_agent
-    if _vision_agent is None:
-        _vision_agent = VisionAgent(
-            ollama_url=OLLAMA_URL,
-            ollama_model=(OLLAMA_VISION_MODEL or OLLAMA_MODEL),
-            get_latest_jpeg=_get_latest_jpeg_for_agent,
-            emit_text=ui_broadcast_final,
-            interval_sec=float(os.getenv("VISION_AGENT_INTERVAL_SEC", "2.5")),
-            history_max=int(os.getenv("VISION_AGENT_HISTORY_MAX", "12")),
-        )
-    return _vision_agent
-
 
 def _viewer_set_latest(jpeg_bytes: bytes) -> None:
-    global viewer_latest_jpeg, viewer_latest_seq
+    global viewer_latest_jpeg, viewer_latest_seq, viewer_latest_t
     if not jpeg_bytes:
         return
     viewer_latest_jpeg = jpeg_bytes
     viewer_latest_seq += 1
+    viewer_latest_t = time.monotonic()
     try:
         if viewer_new_frame_evt is not None:
             viewer_new_frame_evt.set()
@@ -376,210 +301,15 @@ async def _viewer_broadcast_loop():
 
         last_sent_seq = seq
 
-# 【新增】盲道导航相关全局变量
-blind_path_navigator = None
-navigation_active = False
-yolo_seg_model = None
-obstacle_detector = None
 
-# 【新增】过马路导航相关全局变量
-cross_street_navigator = None
-cross_street_active = False
-orchestrator = None  # 新增
-
-# 【新增】omni对话状态标志
-omni_conversation_active = False  # 标记omni对话是否正在进行
-omni_previous_nav_state = None  # 保存omni激活前的导航状态，用于恢复
-
-# 【新增】模型加载函数
-def load_navigation_models():
-    """加载盲道导航所需的模型"""
-    global yolo_seg_model, obstacle_detector
-
-    try:
-        seg_model_path = os.getenv("BLIND_PATH_MODEL", r"C:\Users\Administrator\Desktop\rebuild1002\model\yolo-seg.pt")
-        #print(f"[NAVIGATION] 尝试加载模型: {seg_model_path}")
-
-        if os.path.exists(seg_model_path):
-            print(f"[NAVIGATION] 模型文件存在，开始加载...")
-            yolo_seg_model = YOLO(seg_model_path)
-
-            # 强制放到 GPU
-            if torch.cuda.is_available():
-                yolo_seg_model.to("cuda")
-                print(f"[NAVIGATION] 盲道分割模型加载成功并放到GPU: {yolo_seg_model.device}")
-            else:
-                print("[NAVIGATION] CUDA不可用，模型仍在CPU")
-
-            # 测试模型是否能正常运行
-            try:
-                test_img = np.zeros((640, 640, 3), dtype=np.uint8)
-                results = yolo_seg_model.predict(
-                    test_img,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                    verbose=False
-                )
-                print(f"[NAVIGATION] 模型测试成功，支持的类别数: {len(yolo_seg_model.names) if hasattr(yolo_seg_model, 'names') else '未知'}")
-                if hasattr(yolo_seg_model, 'names'):
-                    print(f"[NAVIGATION] 模型类别: {yolo_seg_model.names}")
-            except Exception as e:
-                print(f"[NAVIGATION] 模型测试失败: {e}")
-        else:
-            print(f"[NAVIGATION] 错误：找不到模型文件: {seg_model_path}")
-            print(f"[NAVIGATION] 当前工作目录: {os.getcwd()}")
-            print(f"[NAVIGATION] 请检查文件路径是否正确")
-            
-        # 【修改开始】使用 ObstacleDetectorClient 替代直接的 YOLO
-        obstacle_model_path = os.getenv("OBSTACLE_MODEL", r"C:\Users\Administrator\Desktop\rebuild1002\model\yoloe-11l-seg.pt")
-        print(f"[NAVIGATION] 尝试加载障碍物检测模型: {obstacle_model_path}")
-        
-        if os.path.exists(obstacle_model_path):
-            print(f"[NAVIGATION] 障碍物检测模型文件存在，开始加载...")
-            try:
-                # 使用 ObstacleDetectorClient 封装的 YOLO-E
-                obstacle_detector = ObstacleDetectorClient(model_path=obstacle_model_path)
-                print(f"[NAVIGATION] ========== YOLO-E 障碍物检测器加载成功 ==========")
-                
-                # 检查模型是否成功加载
-                if hasattr(obstacle_detector, 'model') and obstacle_detector.model is not None:
-                    print(f"[NAVIGATION] YOLO-E 模型已初始化")
-                    print(f"[NAVIGATION] 模型设备: {next(obstacle_detector.model.parameters()).device}")
-                else:
-                    print(f"[NAVIGATION] 警告：YOLO-E 模型初始化异常")
-                
-                # 检查白名单是否成功加载
-                if hasattr(obstacle_detector, 'WHITELIST_CLASSES'):
-                    print(f"[NAVIGATION] 白名单类别数: {len(obstacle_detector.WHITELIST_CLASSES)}")
-                    print(f"[NAVIGATION] 白名单前10个类别: {', '.join(obstacle_detector.WHITELIST_CLASSES[:10])}")
-                else:
-                    print(f"[NAVIGATION] 警告：白名单类别未定义")
-                
-                # 检查文本特征是否成功预计算
-                if hasattr(obstacle_detector, 'whitelist_embeddings') and obstacle_detector.whitelist_embeddings is not None:
-                    print(f"[NAVIGATION] YOLO-E 文本特征已预计算")
-                    print(f"[NAVIGATION] 文本特征张量形状: {obstacle_detector.whitelist_embeddings.shape if hasattr(obstacle_detector.whitelist_embeddings, 'shape') else '未知'}")
-                else:
-                    print(f"[NAVIGATION] 警告：YOLO-E 文本特征未预计算")
-                
-                # 测试障碍物检测功能
-                print(f"[NAVIGATION] 开始测试 YOLO-E 检测功能...")
-                try:
-                    test_img = np.zeros((640, 640, 3), dtype=np.uint8)
-                    # 在测试图像中画一个白色矩形，模拟一个物体
-                    cv2.rectangle(test_img, (200, 200), (400, 400), (255, 255, 255), -1)
-                    
-                    # 测试检测（不提供 path_mask）
-                    test_results = obstacle_detector.detect(test_img)
-                    print(f"[NAVIGATION] YOLO-E 检测测试成功!")
-                    print(f"[NAVIGATION] 测试检测结果数: {len(test_results)}")
-                    
-                    if len(test_results) > 0:
-                        print(f"[NAVIGATION] 测试检测到的物体:")
-                        for i, obj in enumerate(test_results):
-                            print(f"  - 物体 {i+1}: {obj.get('name', 'unknown')}, "
-                                  f"面积比例: {obj.get('area_ratio', 0):.3f}, "
-                                  f"位置: ({obj.get('center_x', 0):.0f}, {obj.get('center_y', 0):.0f})")
-                except Exception as e:
-                    print(f"[NAVIGATION] YOLO-E 检测测试失败: {e}")
-                    import traceback
-                    traceback.print_exc()
-                
-                print(f"[NAVIGATION] ========== YOLO-E 障碍物检测器加载完成 ==========")
-                
-            except Exception as e:
-                print(f"[NAVIGATION] 障碍物检测器加载失败: {e}")
-                import traceback
-                traceback.print_exc()
-                obstacle_detector = None
-        else:
-            print(f"[NAVIGATION] 警告：找不到障碍物检测模型文件: {obstacle_model_path}")
-        
-    except Exception as e:
-        print(f"[NAVIGATION] 模型加载失败: {e}")
-        import traceback
-        traceback.print_exc()
-
-if ENABLE_NAV_MODELS:
-    print("[NAVIGATION] 开始加载导航模型...")
-    load_navigation_models()
-    print(f"[NAVIGATION] 模型加载完成 - yolo_seg_model: {yolo_seg_model is not None}")
-else:
-    print("[NAVIGATION] 已跳过导航模型加载（ENABLE_NAV_MODELS=0 / LITE_MODE=1）")
-
-# 【新增】启动同步录制
-if ENABLE_RECORDER and RECORDER_AUTOSTART and CAMERA_RECORD_ENABLED:
-    print("[RECORDER] 启动同步录制系统...")
-    sync_recorder.start_recording()
-    print("[RECORDER] 录制系统已启动，将自动保存视频和音频")
-else:
-    print("[RECORDER] 已禁用录制（ENABLE_RECORDER=0 或 RECORDER_AUTOSTART=0 或 CAMERA_RECORD_ENABLED=0）")
-
-# 【新增】注册退出处理器，确保Ctrl+C时保存录制文件
-def cleanup_on_exit():
-    """程序退出时的清理工作"""
-    if not ENABLE_RECORDER:
-        return
-    print("\n[SYSTEM] 正在关闭录制器...")
-    try:
-        sync_recorder.stop_recording()
-        print("[SYSTEM] 录制文件已保存")
-    except Exception as e:
-        print(f"[SYSTEM] 关闭录制器时出错: {e}")
-
-def signal_handler(sig, frame):
-    """处理Ctrl+C信号"""
-    print("\n[SYSTEM] 收到中断信号，正在安全退出...")
-    cleanup_on_exit()
-    import sys
-    sys.exit(0)
-
-# 注册信号处理器
-signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-signal.signal(signal.SIGTERM, signal_handler)  # 终止信号
-atexit.register(cleanup_on_exit)  # 正常退出时也调用
-
-if ENABLE_RECORDER:
-    print("[RECORDER] 已注册退出处理器 - Ctrl+C时会自动保存录制文件")
-
-
-
-# 【新增】预加载红绿灯检测模型（避免进入WAIT_TRAFFIC_LIGHT状态时卡顿）
-if ENABLE_TRAFFIC_LIGHT:
-    try:
-        import trafficlight_detection
-        print("[TRAFFIC_LIGHT] 开始预加载红绿灯检测模型...")
-        if trafficlight_detection.init_model():
-            print("[TRAFFIC_LIGHT] 红绿灯检测模型预加载成功")
-            # 执行一次测试推理，完全预热模型
-            try:
-                test_img = np.zeros((640, 640, 3), dtype=np.uint8)
-                _ = trafficlight_detection.process_single_frame(test_img)
-                print("[TRAFFIC_LIGHT] 模型预热完成")
-            except Exception as e:
-                print(f"[TRAFFIC_LIGHT] 模型预热失败: {e}")
-        else:
-            print("[TRAFFIC_LIGHT] 红绿灯检测模型预加载失败")
-    except Exception as e:
-        print(f"[TRAFFIC_LIGHT] 红绿灯模型预加载出错: {e}")
-else:
-    print("[TRAFFIC_LIGHT] 已跳过红绿灯模型预加载（ENABLE_TRAFFIC_LIGHT=0 / LITE_MODE=1）")
-
-# ============== 关键：系统级"硬重置"总闸 =================
-interrupt_lock = asyncio.Lock()
 
 # ============== YOLO媒体线程管理 =================
 yolomedia_thread: Optional[threading.Thread] = None
 yolomedia_stop_event = threading.Event()
 yolomedia_running = False
 yolomedia_sending_frames = False  # 新增：标记YOLO是否已经开始发送处理后的帧
-
-# 物品名称到YOLO类别的映射
-ITEM_TO_CLASS_MAP = {
-    "红牛": "Red_Bull",
-    "AD钙奶": "AD_milk",
-    "ad钙奶": "AD_milk",
-    "钙奶": "AD_milk",
-}
+_yolomedia_last_frame_t: float = 0.0
+YOLO_FRAME_STALE_SEC = float(os.getenv("YOLO_FRAME_STALE_SEC", "2.0"))
 
 async def ui_broadcast_raw(msg: str):
     dead = []
@@ -604,19 +334,11 @@ async def ui_broadcast_final(text: str):
     if len(recent_finals) > RECENT_MAX:
         recent_finals = recent_finals[-RECENT_MAX:]
     await ui_broadcast_raw("FINAL:" + text)
-    print(f"[ASR/AI FINAL] {text}", flush=True)
+    print(f"[UI FINAL] {text}", flush=True)
 
 
 class DescribeRequest(BaseModel):
     prompt: Optional[str] = None
-
-
-class AgentStartRequest(BaseModel):
-    interval_sec: Optional[float] = None
-
-
-class AgentStepRequest(BaseModel):
-    task: Optional[str] = None
 
 
 async def _ollama_describe_image(jpeg_bytes: bytes, prompt: Optional[str] = None) -> str:
@@ -716,54 +438,17 @@ async def _describe_current_frame(prompt: Optional[str] = None) -> None:
         err = str(e).strip() or repr(e)
         await ui_broadcast_final(f"[AI] (vision) Failed: {err}")
 
-async def full_system_reset(reason: str = ""):
-    """
-    回到刚启动后的状态：
-    1) 停播 + 取消AI任务 + 切断所有/stream.wav（hard_reset_audio）
-    2) 停止 ASR 实时识别流（关键）
-    3) 清 UI 状态
-    4) 清最近相机帧（避免把旧帧又拼进下一轮）
-    5) 告知 ESP32：RESET（可选）
-    """
-    # 1) 音频&AI
-    await hard_reset_audio(reason or "full_system_reset")
-
-    # 2) ASR
-    await stop_current_recognition()
-
-    # 3) UI
-    global current_partial, recent_finals
-    current_partial = ""
-    recent_finals = []
-
-    # 4) 相机帧
-    try:
-        last_frames.clear()
-    except Exception:
-        pass
-
-    # 5) 通知 ESP32
-    try:
-        if esp32_audio_ws and (esp32_audio_ws.client_state == WebSocketState.CONNECTED):
-            await esp32_audio_ws.send_text("RESET")
-    except Exception:
-        pass
-
-    print("[SYSTEM] full reset done.", flush=True)
-
 # ========= 启动/停止 YOLO 媒体处理 =========
-def start_yolomedia_with_target(target_name: str):
-    """启动yolomedia线程，搜索指定物品"""
+def start_cards_yolomedia():
+    """Start YOLO poker-cards mode."""
     global yolomedia_thread, yolomedia_stop_event, yolomedia_running, yolomedia_sending_frames
     
     # 如果已经在运行，先停止
     if yolomedia_running:
         stop_yolomedia()
     
-    # 查找对应的YOLO类别
-    yolo_class = ITEM_TO_CLASS_MAP.get(target_name, target_name)
-    print(f"[YOLOMEDIA] Starting with target: {target_name} -> YOLO class: {yolo_class}", flush=True)
-    print(f"[YOLOMEDIA] Available mappings: {ITEM_TO_CLASS_MAP}", flush=True)  # 添加这行调试
+    yolo_class = "cards"
+    print(f"[YOLOMEDIA] Starting cards mode: {yolo_class}", flush=True)
     
     yolomedia_stop_event.clear()
     yolomedia_running = True
@@ -771,7 +456,6 @@ def start_yolomedia_with_target(target_name: str):
     
     def _run():
         try:
-            # 传递目标类别名和停止事件
             yolomedia.main(headless=True, prompt_name=yolo_class, stop_event=yolomedia_stop_event)
         except Exception as e:
             print(f"[YOLOMEDIA] worker stopped: {e}", flush=True)
@@ -798,345 +482,9 @@ def stop_yolomedia():
         
         yolomedia_running = False
         yolomedia_sending_frames = False
-        
-        # 【新增】如果orchestrator在找物品模式，结束时不自动恢复（由命令控制）
-        # 只清理标志位即可
-        print("[YOLOMEDIA] Worker stopped, 等待状态切换.", flush=True)
 
-# ========= 自定义的 start_ai_with_text，支持识别特殊命令 =========
-async def start_ai_with_text_custom(user_text: str):
-    """扩展版的AI启动函数，支持识别特殊命令"""
-    global navigation_active, blind_path_navigator, cross_street_active, cross_street_navigator, orchestrator
-    
-    # 【修改】在导航模式和红绿灯检测模式下，只有特定词才进入omni对话
-    if orchestrator:
-        current_state = orchestrator.get_state()
-        # 如果在导航模式或红绿灯检测模式（非CHAT模式）
-        if current_state not in ["CHAT", "IDLE"]:
-            # 检查是否是允许的对话触发词
-            allowed_keywords = [
-                "帮我看", "帮我看下", "帮我找", "找一下", "看看", "识别一下",
-                # 扑克牌识别（专用指令）
-                "扑克牌", "撲克牌", "扑克", "撲克", "看牌", "识别牌", "辨识牌",
-            ]
-            is_allowed_query = any(keyword in user_text for keyword in allowed_keywords)
-            
-            # 检查是否是导航控制命令
-            nav_control_keywords = ["开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航", 
-                                   "检测红绿灯", "看红绿灯", "停止检测", "停止红绿灯"]
-            is_nav_control = any(keyword in user_text for keyword in nav_control_keywords)
-            
-            # 如果既不是允许的查询，也不是导航控制命令，则丢弃
-            if not is_allowed_query and not is_nav_control:
-                mode_name = "红绿灯检测" if current_state == "TRAFFIC_LIGHT_DETECTION" else "导航"
-                print(f"[{mode_name}模式] 丢弃非对话语音: {user_text}")
-                return  # 直接丢弃，不进入omni
-    
-    # 【修改】检查是否是过马路相关命令 - 使用orchestrator控制
-    if "开始过马路" in user_text or "帮我过马路" in user_text:
-        # 【新增】如果正在找物品，先停止
-        if yolomedia_running:
-            stop_yolomedia()
-            print("[ITEM_SEARCH] 从找物品模式切换到过马路")
-        
-        if orchestrator:
-            orchestrator.start_crossing()
-            print(f"[CROSS_STREET] 过马路模式已启动，状态: {orchestrator.get_state()}")
-            # 播放启动语音并广播到UI
-            play_voice_text("过马路模式已启动。")
-            await ui_broadcast_final("[SYSTEM] Cross-street mode started")
-        else:
-            print("[CROSS_STREET] 警告：导航统领器未初始化！")
-            play_voice_text("启动过马路模式失败，请稍后重试。")
-            await ui_broadcast_final("[SYSTEM] Navigation is not ready")
-        return
-    
-    if "过马路结束" in user_text or "结束过马路" in user_text:
-        if orchestrator:
-            orchestrator.stop_navigation()
-            print(f"[CROSS_STREET] 导航已停止，状态: {orchestrator.get_state()}")
-            # 播放停止语音并广播到UI
-            play_voice_text("已停止导航。")
-            await ui_broadcast_final("[SYSTEM] Cross-street mode stopped")
-        else:
-            await ui_broadcast_final("[SYSTEM] Navigation is not running")
-        return
-    
-    # 【修改】检查是否是红绿灯检测命令 - 实现与盲道导航互斥
-    if "检测红绿灯" in user_text or "看红绿灯" in user_text:
-        try:
-            import trafficlight_detection
-            
-            # 切换orchestrator到红绿灯检测模式（暂停盲道导航）
-            if orchestrator:
-                orchestrator.start_traffic_light_detection()
-                print(f"[TRAFFIC] 切换到红绿灯检测模式，状态: {orchestrator.get_state()}")
-            
-            # 【改进】使用主线程模式而不是独立线程，避免掉帧
-            success = trafficlight_detection.init_model()  # 只初始化模型，不启动线程
-            trafficlight_detection.reset_detection_state()  # 重置状态
-            
-            if success:
-                await ui_broadcast_final("[SYSTEM] Traffic light detection started")
-            else:
-                await ui_broadcast_final("[SYSTEM] Failed to load traffic light model")
-        except Exception as e:
-            print(f"[TRAFFIC] 启动红绿灯检测失败: {e}")
-            await ui_broadcast_final(f"[系统] 启动失败: {e}")
-        return
-    
-    if "停止检测" in user_text or "停止红绿灯" in user_text:
-        try:
-            # 恢复到对话模式
-            if orchestrator:
-                orchestrator.stop_navigation()  # 回到CHAT模式
-                print(f"[TRAFFIC] 红绿灯检测停止，恢复到{orchestrator.get_state()}模式")
-            
-            await ui_broadcast_final("[SYSTEM] Traffic light detection stopped")
-        except Exception as e:
-            print(f"[TRAFFIC] 停止红绿灯检测失败: {e}")
-            await ui_broadcast_final(f"[系统] 停止失败: {e}")
-        return
-    
-    # 【修改】检查是否是导航相关命令 - 使用orchestrator控制
-    if "开始导航" in user_text or "盲道导航" in user_text or "帮我导航" in user_text:
-        # 【新增】如果正在找物品，先停止
-        if yolomedia_running:
-            stop_yolomedia()
-            print("[ITEM_SEARCH] 从找物品模式切换到盲道导航")
-        
-        if orchestrator:
-            orchestrator.start_blind_path_navigation()
-            print(f"[NAVIGATION] 盲道导航已启动，状态: {orchestrator.get_state()}")
-            await ui_broadcast_final("[SYSTEM] Blind-path navigation started")
-        else:
-            print("[NAVIGATION] 警告：导航统领器未初始化！")
-            await ui_broadcast_final("[SYSTEM] Navigation is not ready")
-        return
-    
-    if "停止导航" in user_text or "结束导航" in user_text:
-        if orchestrator:
-            orchestrator.stop_navigation()
-            print(f"[NAVIGATION] 导航已停止，状态: {orchestrator.get_state()}")
-            await ui_broadcast_final("[SYSTEM] Blind-path navigation stopped")
-        else:
-            await ui_broadcast_final("[SYSTEM] Navigation is not running")
-        return
+        print("[YOLOMEDIA] Worker stopped.", flush=True)
 
-    nav_cmd_keywords = ["开始过马路", "过马路结束", "开始导航", "盲道导航", "停止导航", "结束导航", "立即通过", "现在通过", "继续"]
-    if any(k in user_text for k in nav_cmd_keywords):
-        if orchestrator:
-            orchestrator.on_voice_command(user_text)
-            await ui_broadcast_final("[SYSTEM] Navigation mode updated")
-        else:
-            await ui_broadcast_final("[SYSTEM] Navigation orchestrator not initialized")
-        return    
-
-    # ===== 扑克牌识别（专用） =====
-    card_keywords = ["扑克牌", "撲克牌", "扑克", "撲克", "看牌", "识别牌", "辨识牌"]
-    is_card_intent = any(k in user_text for k in card_keywords)
-
-    # 停止扑克牌识别
-    if is_card_intent and ("停止" in user_text or "结束" in user_text or "关闭" in user_text):
-        if yolomedia_running:
-            stop_yolomedia()
-        if orchestrator:
-            orchestrator.stop_item_search(restore_nav=True)
-        await ui_broadcast_final("[SYSTEM] Cards recognition stopped")
-        return
-
-    # 启动扑克牌识别
-    if is_card_intent and (
-        "识别" in user_text
-        or "識別" in user_text
-        or "辨识" in user_text
-        or "辨識" in user_text
-        or "检测" in user_text
-        or "開始" in user_text
-        or "开始" in user_text
-        or "看" in user_text
-        or (user_text.strip() in card_keywords)
-    ):
-        # 与其他模式互斥：先停掉当前找物品流程
-        if yolomedia_running:
-            stop_yolomedia()
-        if orchestrator:
-            orchestrator.start_item_search()
-            print(f"[CARDS] 已切换到找物品模式（用于扑克牌识别），状态: {orchestrator.get_state()}")
-
-        # 传入一个特殊 target，yolomedia 会识别并切到 cards mode
-        start_yolomedia_with_target("cards")
-        try:
-            play_voice_text("已启动扑克牌识别。")
-        except Exception:
-            pass
-        await ui_broadcast_final("[SYSTEM] Cards recognition started")
-        return
-
-    # 检查是否是"帮我找/识别一下xxx"的命令
-    # 扩展正则表达式，支持更多关键词
-    find_pattern = r"(?:^\s*帮我)?\s*找一下\s*(.+?)(?:。|！|？|$)"
-    match = re.search(find_pattern, user_text)
-        
-    if match:
-        # 提取中文物品名称
-        item_cn = match.group(1).strip()
-        if item_cn:
-            # 【新增】用本地映射 + Qwen 提取英文类名
-            label_en, src = extract_english_label(item_cn)
-            print(f"[COMMAND] Finder request: '{item_cn}' -> '{label_en}' (src={src})", flush=True)
-
-            # 【新增】切换到找物品模式（暂停导航）
-            if orchestrator:
-                orchestrator.start_item_search()
-                print(f"[ITEM_SEARCH] 已切换到找物品模式，状态: {orchestrator.get_state()}")
-            
-            # 【关键】把英文类名传给 yolomedia（它会在找不到类时自动切 YOLOE）
-            start_yolomedia_with_target(label_en)
-
-            # 给前端/语音来个确认反馈
-            try:
-                await ui_broadcast_final(f"[FINDER] Looking for {item_cn}...")
-            except Exception:
-                pass
-
-            return
-    
-    # 检查是否是"找到了"的命令
-    if "找到了" in user_text or "拿到了" in user_text:
-        print("[COMMAND] Found command detected", flush=True)
-        # 停止yolomedia
-        stop_yolomedia()
-        
-        # 【新增】停止找物品模式，恢复之前的导航状态
-        if orchestrator:
-            orchestrator.stop_item_search(restore_nav=True)
-            current_state = orchestrator.get_state()
-            print(f"[ITEM_SEARCH] 找物品结束，当前状态: {current_state}")
-            
-            # 根据恢复的状态给出反馈
-            if current_state in ["BLINDPATH_NAV", "SEEKING_CROSSWALK", "WAIT_TRAFFIC_LIGHT", "CROSSING", "SEEKING_NEXT_BLINDPATH"]:
-                await ui_broadcast_final("[FINDER] Item found. Resuming navigation.")
-            else:
-                await ui_broadcast_final("[FINDER] Item found.")
-        else:
-            await ui_broadcast_final("[FINDER] Item found.")
-        
-        return
-    
-    # 【修改】omni对话开始时，切换到CHAT模式
-    global omni_conversation_active, omni_previous_nav_state
-    omni_conversation_active = True
-    
-    # 保存当前导航状态并切换到CHAT模式
-    if orchestrator:
-        current_state = orchestrator.get_state()
-        # 只有在导航模式下才需要保存和切换
-        if current_state not in ["CHAT", "IDLE"]:
-            omni_previous_nav_state = current_state
-            orchestrator.force_state("CHAT")
-            print(f"[OMNI] 对话开始，从{current_state}切换到CHAT模式")
-        else:
-            omni_previous_nav_state = None
-            print(f"[OMNI] 对话开始（当前已在{current_state}模式）")
-    
-    # 如果不是特殊命令，执行原有的AI对话逻辑
-    # 但如果yolomedia正在运行，暂时不处理普通对话
-    if yolomedia_running:
-        print("[AI] YOLO media is running, skipping normal AI response", flush=True)
-        return
-    
-    # 原有的AI对话逻辑
-    await start_ai_with_text(user_text)
-
-# ========= Omni 播放启动 =========
-async def start_ai_with_text(user_text: str):
-    """硬重置后，开启新的 AI 语音输出。"""
-    async def _runner():
-        txt_buf: List[str] = []
-        rate_state = None
-
-        # 组装（图像+文本）
-        content_list = []
-        if last_frames:
-            try:
-                _, jpeg_bytes = last_frames[-1]
-                img_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
-                content_list.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-                })
-            except Exception:
-                pass
-        content_list.append({"type": "text", "text": user_text})
-
-        try:
-            async for piece in stream_chat(content_list, voice="Cherry", audio_format="wav"):
-                # 文本增量（仅 UI）
-                if piece.text_delta:
-                    txt_buf.append(piece.text_delta)
-                    try:
-                        await ui_broadcast_partial("[AI] " + "".join(txt_buf))
-                    except Exception:
-                        pass
-
-                # 音频分片：Omni 返回 24k (PCM16) 的 wav audio.data（Base64）；下行需要 8k PCM16
-                if piece.audio_b64:
-                    try:
-                        pcm24 = base64.b64decode(piece.audio_b64)
-                    except Exception:
-                        pcm24 = b""
-                    if pcm24:
-                        # 24k → 8k (使用ratecv保证音调和速度不变)
-                        pcm8k, rate_state = audioop.ratecv(pcm24, 2, 1, 24000, 8000, rate_state)
-                        pcm8k = audioop.mul(pcm8k, 2, 0.60)
-                        if pcm8k:
-                            await broadcast_pcm16_realtime(pcm8k)
-
-        except asyncio.CancelledError:
-            # 被新一轮打断
-            raise
-        except Exception as e:
-            try:
-                await ui_broadcast_final(f"[AI] 发生错误：{e}")
-            except Exception:
-                pass
-        finally:
-            # 【修改】标记omni对话结束，恢复之前的导航模式
-            global omni_conversation_active, omni_previous_nav_state
-            omni_conversation_active = False
-            
-            # 恢复之前的导航状态
-            if orchestrator and omni_previous_nav_state:
-                orchestrator.force_state(omni_previous_nav_state)
-                print(f"[OMNI] 对话结束，恢复到{omni_previous_nav_state}模式")
-                omni_previous_nav_state = None
-            else:
-                print(f"[OMNI] 对话结束（无需恢复导航状态）")
-            
-            # 自然结束时，给当前连接一个 "完结" 信号
-            from audio_stream import stream_clients  # 局部导入，避免环依赖
-            for sc in list(stream_clients):
-                if not sc.abort_event.is_set():
-                    try: sc.q.put_nowait(b"\x00"*BYTES_PER_20MS_16K)  # 一帧静音
-                    except Exception: pass
-                    try: sc.q.put_nowait(None)
-                    except Exception: pass
-
-            final_text = ("".join(txt_buf)).strip() or "（空响应）"
-            try:
-                await ui_broadcast_final("[AI] " + final_text)
-            except Exception:
-                pass
-
-    # 真正启动前先硬重置，保证**绝无**旧音频残留
-    await hard_reset_audio("start_ai_with_text")
-    loop = asyncio.get_running_loop()
-    from audio_stream import current_ai_task as _task_holder  # 读写模块内全局
-    from audio_stream import __dict__ as _as_dict
-    # 设置模块内的 current_ai_task
-    task = loop.create_task(_runner())
-    _as_dict["current_ai_task"] = task
 
 # ---------- 页面 / 健康 ----------
 @app.get("/", response_class=HTMLResponse)
@@ -1154,6 +502,131 @@ def health():
     return "OK"
 
 
+@app.get("/api/camera/debug")
+async def api_camera_debug() -> Dict[str, Any]:
+    now = time.monotonic()
+    frame_age = (now - camera_rx_last_frame_t) if camera_rx_last_frame_t else None
+    msg_age = (now - camera_rx_last_msg_t) if camera_rx_last_msg_t else None
+    text_age = (now - camera_rx_last_text_t) if camera_rx_last_text_t else None
+    no_frames_yet_age = (now - camera_rx_connected_at) if (camera_rx_connected and (camera_rx_last_frame_t <= 0) and camera_rx_connected_at) else None
+    frame_stalled = False
+    if ESP32_CAMERA_FRAME_TIMEOUT_SEC and ESP32_CAMERA_FRAME_TIMEOUT_SEC > 0:
+        if frame_age is not None and frame_age > ESP32_CAMERA_FRAME_TIMEOUT_SEC:
+            frame_stalled = True
+        if no_frames_yet_age is not None and no_frames_yet_age > ESP32_CAMERA_FRAME_TIMEOUT_SEC:
+            frame_stalled = True
+    return {
+        "ok": True,
+        "connected": camera_rx_connected,
+        "connected_for_sec": round(now - camera_rx_connected_at, 3) if camera_rx_connected_at else None,
+        "msg_count": camera_rx_msg_count,
+        "text_count": camera_rx_text_count,
+        "bytes_count": camera_rx_bytes_count,
+        "last_msg_age_sec": round(msg_age, 3) if msg_age is not None else None,
+        "last_frame_age_sec": round(frame_age, 3) if frame_age is not None else None,
+        "last_frame_size": camera_rx_last_frame_size,
+        "invalid_jpeg_count": camera_rx_invalid_jpeg_count,
+        "last_invalid_jpeg_reason": camera_rx_last_invalid_jpeg_reason,
+        "last_text": camera_rx_last_text,
+        "last_text_age_sec": round(text_age, 3) if text_age is not None else None,
+        "frame_timeout_sec": ESP32_CAMERA_FRAME_TIMEOUT_SEC,
+        "frame_stalled": frame_stalled,
+        "viewer_clients": len(camera_viewers),
+        "viewer_latest_seq": viewer_latest_seq,
+        "viewer_latest_age_sec": round(now - viewer_latest_t, 3) if viewer_latest_t else None,
+    }
+
+
+@app.get("/api/viewer/last.jpg")
+async def api_viewer_last_jpg() -> Response:
+    """Return the latest JPEG that would be sent to /ws/viewer.
+
+    This is useful to verify Cards/YOLO overlays, because /api/camera/last.jpg
+    intentionally returns the raw incoming camera frame.
+    """
+    jpeg = viewer_latest_jpeg
+    if not jpeg:
+        return Response(status_code=404, content=b"no viewer frame")
+    return Response(
+        content=jpeg,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/camera/last.jpg")
+async def api_camera_last_jpg() -> Response:
+    jpeg: Optional[bytes] = None
+    if last_frames:
+        try:
+            _, jpeg = last_frames[-1]
+        except Exception:
+            jpeg = None
+    if jpeg is None:
+        jpeg = viewer_latest_jpeg
+
+    if not jpeg:
+        return Response(status_code=404, content=b"no frame")
+
+    return Response(
+        content=jpeg,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/api/cards/start")
+async def api_cards_start() -> Dict[str, Any]:
+    """Start poker cards recognition (YOLO)."""
+    if yolomedia is None:
+        return {"ok": False, "error": "yolomedia_unavailable"}
+
+    try:
+        start_cards_yolomedia()
+        try:
+            await ui_broadcast_final("[SYSTEM] Cards recognition started")
+        except Exception:
+            pass
+        return {"ok": True}
+    except Exception as e:
+        try:
+            await ui_broadcast_final(f"[SYSTEM] Cards start failed: {e}")
+        except Exception:
+            pass
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/cards/stop")
+async def api_cards_stop() -> Dict[str, Any]:
+    """Stop cards recognition."""
+    try:
+        if yolomedia_running:
+            stop_yolomedia()
+        try:
+            await ui_broadcast_final("[SYSTEM] Cards recognition stopped")
+        except Exception:
+            pass
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/camera/snap")
+async def api_camera_snap() -> Dict[str, Any]:
+    jpeg = await _esp32_request_hq_snapshot()
+    if jpeg:
+        try:
+            last_frames.append((time.time(), jpeg))
+        except Exception:
+            pass
+        try:
+            _viewer_set_latest(jpeg)
+        except Exception:
+            pass
+        return {"ok": True, "received": True, "size": len(jpeg)}
+    return {"ok": True, "received": False, "size": 0}
+
+
 @app.post("/api/describe")
 async def api_describe(req: DescribeRequest):
     # Single-flight: avoid stacking expensive vision requests.
@@ -1166,49 +639,6 @@ async def api_describe(req: DescribeRequest):
 
     asyncio.create_task(_run())
     return {"ok": True, "status": "accepted"}
-
-
-@app.get("/api/agent/status")
-async def api_agent_status():
-    agent = _ensure_vision_agent()
-    st = agent.status()
-    return {
-        "ok": True,
-        "running": st.running,
-        "interval_sec": st.interval_sec,
-        "last_step_at": st.last_step_at,
-        "steps": st.steps,
-        "last_error": st.last_error,
-        "model": (OLLAMA_VISION_MODEL or OLLAMA_MODEL),
-        "ollama_url": OLLAMA_URL,
-    }
-
-
-@app.post("/api/agent/start")
-async def api_agent_start(req: AgentStartRequest):
-    agent = _ensure_vision_agent()
-    if req.interval_sec is not None:
-        agent.configure(interval_sec=req.interval_sec)
-    await agent.start()
-    return {"ok": True, "running": True, "interval_sec": agent.status().interval_sec}
-
-
-@app.post("/api/agent/stop")
-async def api_agent_stop():
-    agent = _ensure_vision_agent()
-    await agent.stop()
-    return {"ok": True, "running": False}
-
-
-@app.post("/api/agent/step")
-async def api_agent_step(req: AgentStepRequest):
-    agent = _ensure_vision_agent()
-    # One-off step (does not require agent loop running)
-    result = await agent.step_once(user_task=req.task)
-    return {"ok": True, "result": result}
-
-# 注册 /stream.wav
-register_stream_route(app)
 
 # ---------- WebSocket：WebUI 文本（ASR/AI 状态推送） ----------
 @app.websocket("/ws_ui")
@@ -1223,156 +653,18 @@ async def ws_ui(ws: WebSocket):
             return
         while True:
             await asyncio.sleep(60)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, asyncio.CancelledError):
         pass
     finally:
         ui_clients.pop(id(ws), None)
 
-# ---------- WebSocket：ESP32 音频入口（ASR 上行） ----------
-@app.websocket("/ws_audio")
-async def ws_audio(ws: WebSocket):
-    global esp32_audio_ws
-    esp32_audio_ws = ws
-    await ws.accept()
-    print("\n[AUDIO] client connected")
-    recognition = None
-    streaming = False
-    last_ts = time.monotonic()
-    keepalive_task: Optional[asyncio.Task] = None
-
-    async def stop_rec(send_notice: Optional[str] = None):
-        nonlocal recognition, streaming, keepalive_task
-        if keepalive_task and not keepalive_task.done():
-            keepalive_task.cancel()
-            try: await keepalive_task
-            except Exception: pass
-        keepalive_task = None
-        if recognition:
-            try: recognition.stop()
-            except Exception: pass
-            recognition = None
-        await set_current_recognition(None)
-        streaming = False
-        if send_notice:
-            try: await ws.send_text(send_notice)
-            except Exception: pass
-
-    async def on_sdk_error(_msg: str):
-        await stop_rec(send_notice="RESTART")
-
-    async def keepalive_loop():
-        nonlocal last_ts, recognition, streaming
-        try:
-            while streaming and recognition is not None:
-                idle = time.monotonic() - last_ts
-                if idle > 0.35:
-                    try:
-                        for _ in range(30):  # ~600ms 静音
-                            recognition.send_audio_frame(SILENCE_20MS)
-                        last_ts = time.monotonic()
-                    except Exception:
-                        await on_sdk_error("keepalive send failed")
-                        return
-                await asyncio.sleep(0.10)
-        except asyncio.CancelledError:
-            return
-
-    try:
-        while True:
-            if WebSocketState and ws.client_state != WebSocketState.CONNECTED:
-                break
-            try:
-                msg = await ws.receive()
-            except WebSocketDisconnect:
-                break
-            except RuntimeError as e:
-                if "Cannot call \"receive\"" in str(e):
-                    break
-                raise
-
-            if "text" in msg and msg["text"] is not None:
-                raw = (msg["text"] or "").strip()
-                cmd = raw.upper()
-
-                if cmd == "START":
-                    print("[AUDIO] START received")
-                    await stop_rec()
-                    loop = asyncio.get_running_loop()
-                    def post(coro):
-                        asyncio.run_coroutine_threadsafe(coro, loop)
-
-                    # 组装 ASR 回调（把依赖都注入）
-                    cb = ASRCallback(
-                        on_sdk_error=lambda s: post(on_sdk_error(s)),
-                        post=post,
-                        ui_broadcast_partial=ui_broadcast_partial,
-                        ui_broadcast_final=ui_broadcast_final,
-                        is_playing_now_fn=is_playing_now,
-                        start_ai_with_text_fn=start_ai_with_text_custom,  # 使用自定义版本
-                        full_system_reset_fn=full_system_reset,
-                        interrupt_lock=interrupt_lock,
-                    )
-
-                    # Only initialize DashScope ASR if the dashscope.audio module is present
-                    # and an API key is provided. Otherwise return an error to the client.
-                    if dash_audio is None or not API_KEY:
-                        await ws.send_text("ERR:ASR_UNAVAILABLE")
-                        continue
-
-                    recognition = dash_audio.asr.Recognition(
-                        api_key=API_KEY, model=MODEL, format=AUDIO_FMT,
-                        sample_rate=SAMPLE_RATE, callback=cb
-                    )
-                    recognition.start()
-                    await set_current_recognition(recognition)
-                    streaming = True
-                    last_ts = time.monotonic()
-                    keepalive_task = asyncio.create_task(keepalive_loop())
-                    await ui_broadcast_partial("（已开始接收音频…）")
-                    await ws.send_text("OK:STARTED")
-
-                elif cmd == "STOP":
-                    if recognition:
-                        for _ in range(15):  # ~300ms 静音
-                            try: recognition.send_audio_frame(SILENCE_20MS)
-                            except Exception: break
-                    await stop_rec(send_notice="OK:STOPPED")
-
-                elif raw.startswith("PROMPT:"):
-                    # 设备端主动发起一轮：同样使用“先硬重置后播放”的强语义
-                    text = raw[len("PROMPT:"):].strip()
-                    if text:
-                        async with interrupt_lock:
-                            await start_ai_with_text_custom(text) # 使用自定义的启动函数
-                        await ws.send_text("OK:PROMPT_ACCEPTED")
-                    else:
-                        await ws.send_text("ERR:EMPTY_PROMPT")
-
-            elif "bytes" in msg and msg["bytes"] is not None:
-                if streaming and recognition:
-                    try:
-                        recognition.send_audio_frame(msg["bytes"])
-                        last_ts = time.monotonic()
-                    except Exception:
-                        await on_sdk_error("send_audio_frame failed")
-
-    except Exception as e:
-        print(f"\n[WS ERROR] {e}")
-    finally:
-        await stop_rec()
-        try:
-            if WebSocketState is None or ws.client_state == WebSocketState.CONNECTED:
-                await ws.close(code=1000)
-        except Exception:
-            pass
-        if esp32_audio_ws is ws:
-            esp32_audio_ws = None
-        print("[WS] connection closed")
-
 # ---------- WebSocket：ESP32 相机入口（JPEG 二进制） ----------
 @app.websocket("/ws/camera")
 async def ws_camera_esp(ws: WebSocket):
-    global esp32_camera_ws, blind_path_navigator, cross_street_navigator, cross_street_active, navigation_active, orchestrator
+    global esp32_camera_ws
+    global camera_rx_connected, camera_rx_connected_at, camera_rx_msg_count, camera_rx_text_count
+    global camera_rx_bytes_count, camera_rx_last_msg_t, camera_rx_last_frame_t, camera_rx_last_frame_size
+    global camera_rx_invalid_jpeg_count, camera_rx_last_invalid_jpeg_reason
     if esp32_camera_ws is not None:
         await ws.close(code=1013)
         return
@@ -1380,64 +672,157 @@ async def ws_camera_esp(ws: WebSocket):
     await ws.accept()
     print("[CAMERA] ESP32 connected")
 
+    camera_rx_connected = True
+    camera_rx_connected_at = time.monotonic()
+    camera_rx_msg_count = 0
+    camera_rx_text_count = 0
+    camera_rx_bytes_count = 0
+    camera_rx_last_msg_t = camera_rx_connected_at
+    camera_rx_last_frame_t = 0.0
+    camera_rx_last_frame_size = 0
+    camera_rx_invalid_jpeg_count = 0
+    camera_rx_last_invalid_jpeg_reason = None
+    global camera_rx_last_text, camera_rx_last_text_t
+    camera_rx_last_text = None
+    camera_rx_last_text_t = 0.0
+
     # Ask ESP32 to use a better streaming profile (firmware supports these commands).
-    try:
-        if ESP32_STREAM_FRAMESIZE:
-            await _esp32_send_camera_cmd(f"SET:FRAMESIZE={ESP32_STREAM_FRAMESIZE}")
-        if ESP32_STREAM_QUALITY:
-            await _esp32_send_camera_cmd(f"SET:QUALITY={int(ESP32_STREAM_QUALITY)}")
-        # 0 means unlimited (ESP32 side); otherwise it clamps 5..60.
-        await _esp32_send_camera_cmd(f"SET:FPS={int(ESP32_STREAM_FPS)}")
-    except Exception:
-        pass
-    
-    # 【新增】初始化盲道导航器
-    if blind_path_navigator is None and yolo_seg_model is not None:
-        blind_path_navigator = BlindPathNavigator(yolo_seg_model, obstacle_detector)
-        print("[NAVIGATION] 盲道导航器已初始化")
-    else:
-        if blind_path_navigator is not None:
-            print("[NAVIGATION] 导航器已存在，无需重新初始化")
-        elif yolo_seg_model is None:
-            print("[NAVIGATION] 警告：YOLO模型未加载，无法初始化导航器")
-    
-    # 【新增】初始化过马路导航器
-    if cross_street_navigator is None:
-        if yolo_seg_model:
-            cross_street_navigator = CrossStreetNavigator(
-                seg_model=yolo_seg_model,
-                coco_model=None,  # 不使用交通灯检测
-                obs_model=None    # 暂时也不用障碍物检测，让它更快
-            )
-            print("[CROSS_STREET] 过马路导航器已初始化（简化版 - 仅斑马线检测）")
-        else:
-            print("[CROSS_STREET] 错误：缺少分割模型，无法初始化过马路导航器")
-            
-            if not yolo_seg_model:
-                print("[CROSS_STREET] - 缺少分割模型 (yolo_seg_model)")
-            if not obstacle_detector:
-                print("[CROSS_STREET] - 缺少障碍物检测器 (obstacle_detector)")
-    
-    if orchestrator is None and blind_path_navigator is not None and cross_street_navigator is not None:
-        orchestrator = NavigationMaster(blind_path_navigator, cross_street_navigator)
-        print("[NAV MASTER] 统领状态机已初始化（托管模式）")
+    # Some firmwares/boards can stall when applying framesize changes; allow disabling.
+    if ESP32_SEND_CAMERA_TUNING:
+        try:
+            if ESP32_STREAM_FRAMESIZE:
+                await _esp32_send_camera_cmd(f"SET:FRAMESIZE={ESP32_STREAM_FRAMESIZE}")
+            if ESP32_STREAM_QUALITY:
+                await _esp32_send_camera_cmd(f"SET:QUALITY={int(ESP32_STREAM_QUALITY)}")
+            # 0 means unlimited (ESP32 side); otherwise it clamps 5..60.
+            await _esp32_send_camera_cmd(f"SET:FPS={int(ESP32_STREAM_FPS)}")
+        except Exception:
+            pass
+
     frame_counter = 0  # 添加帧计数器
     t0 = time.monotonic()
     last_log_t = t0
-    last_rx_t = time.monotonic()
+    last_msg_t = time.monotonic()
+    last_frame_t = 0.0
+    sent_stream_kick = False
+
+    def _try_decode_jpeg_text_payload(text_payload: str) -> Optional[bytes]:
+        """Best-effort: accept ESP32 frames sent as base64 text (or JSON/data URL).
+
+        Returns decoded JPEG bytes if it looks like a JPEG, else None.
+        """
+        if not text_payload:
+            return None
+
+        s = text_payload.strip()
+        if not s:
+            return None
+
+        # data URL: data:image/jpeg;base64,...
+        if s.startswith("data:image"):
+            comma = s.find(",")
+            if comma != -1:
+                s = s[comma + 1 :].strip()
+
+        # JSON wrapper: {"jpg":"...base64..."} etc.
+        if s.startswith("{") or s.startswith("["):
+            try:
+                j = json.loads(s)
+                if isinstance(j, dict):
+                    for k in ("jpg", "jpeg", "frame", "data", "image", "b64"):
+                        v = j.get(k)
+                        if isinstance(v, str) and v.strip():
+                            s = v.strip()
+                            break
+            except Exception:
+                return None
+
+        # Heuristic: short strings are likely control messages, not frames.
+        if len(s) < 200:
+            return None
+
+        b64 = "".join(s.split())
+        # Fix missing padding
+        pad = (-len(b64)) % 4
+        if pad:
+            b64 = b64 + ("=" * pad)
+
+        try:
+            raw = base64.b64decode(b64, validate=False)
+        except (binascii.Error, ValueError):
+            return None
+
+        # JPEG magic bytes
+        if raw.startswith(b"\xff\xd8"):
+            return raw
+        return None
     
     try:
         while True:
             try:
                 msg = await asyncio.wait_for(ws.receive(), timeout=ESP32_CAMERA_RX_TIMEOUT_SEC)
             except asyncio.TimeoutError:
-                # ESP32 sometimes stays connected but stops sending; force reconnect.
-                stall_s = time.monotonic() - last_rx_t
-                print(f"[CAMERA] stalled: no frames for {stall_s:.1f}s; closing for reconnect", flush=True)
+                # No WS messages arrived within timeout.
+                stall_s = time.monotonic() - last_msg_t
+                if last_frame_t:
+                    frame_stall_s = time.monotonic() - last_frame_t
+                    print(
+                        f"[CAMERA] stalled: no ws messages for {stall_s:.1f}s (last_frame_age={frame_stall_s:.1f}s); closing for reconnect",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[CAMERA] stalled: no ws messages for {stall_s:.1f}s (no frames received yet); closing for reconnect",
+                        flush=True,
+                    )
                 break
 
+            # If we keep receiving WS messages but no frames, consider the camera stalled.
+            now_mono = time.monotonic()
+            if ESP32_CAMERA_FRAME_TIMEOUT_SEC and ESP32_CAMERA_FRAME_TIMEOUT_SEC > 0:
+                if last_frame_t <= 0.0:
+                    # No frames received since connect
+                    if (now_mono - camera_rx_connected_at) > ESP32_CAMERA_FRAME_TIMEOUT_SEC:
+                        stall_s = now_mono - camera_rx_connected_at
+                        try:
+                            await ui_broadcast_final(
+                                f"[SYSTEM] Camera stalled: connected {stall_s:.1f}s but no frames. Reconnecting…"
+                            )
+                        except Exception:
+                            pass
+                        print(
+                            f"[CAMERA] stalled: connected {stall_s:.1f}s but no frames received; closing for reconnect",
+                            flush=True,
+                        )
+                        break
+                else:
+                    frame_stall_s = now_mono - last_frame_t
+                    if frame_stall_s > ESP32_CAMERA_FRAME_TIMEOUT_SEC:
+                        try:
+                            await ui_broadcast_final(
+                                f"[SYSTEM] Camera stalled: no frames for {frame_stall_s:.1f}s. Reconnecting…"
+                            )
+                        except Exception:
+                            pass
+                        print(
+                            f"[CAMERA] stalled: no frames for {frame_stall_s:.1f}s (keepalive still arriving); closing for reconnect",
+                            flush=True,
+                        )
+                        break
+
+            camera_rx_msg_count += 1
+            last_msg_t = time.monotonic()
+            camera_rx_last_msg_t = last_msg_t
+
             if "text" in msg and msg["text"] is not None:
+                camera_rx_text_count += 1
                 t = (msg["text"] or "").strip()
+                camera_rx_last_text = t[:200] if t else ""
+                camera_rx_last_text_t = time.monotonic()
+
+                # Log the first few non-frame text messages; they often reveal firmware state.
+                if camera_rx_text_count <= 3 and t and t not in ("SNAP:BEGIN", "SNAP:END"):
+                    print(f"[CAMERA] text msg: {t[:120]}", flush=True)
                 if t == "SNAP:BEGIN":
                     # Next binary frame is the HQ snapshot (then SNAP:END)
                     global _esp32_snapshot_active, _esp32_last_snapshot_jpeg
@@ -1454,9 +839,70 @@ async def ws_camera_esp(ws: WebSocket):
                             pass
                     continue
 
+                # Some ESP32 firmwares send JPEG frames as base64 text.
+                decoded = _try_decode_jpeg_text_payload(t)
+                if decoded is not None:
+                    msg["bytes"] = decoded
+                else:
+                    # If we are receiving keepalive/control text but no frames yet, try a one-time "kick"
+                    # to start streaming (some firmwares only begin sending frames after a setting command).
+                    if (not sent_stream_kick) and (last_frame_t <= 0.0):
+                        now_kick = time.monotonic()
+                        if (now_kick - camera_rx_connected_at) >= 1.0:
+                            sent_stream_kick = True
+                            try:
+                                if ESP32_STREAM_FRAMESIZE:
+                                    await _esp32_send_camera_cmd(f"SET:FRAMESIZE={ESP32_STREAM_FRAMESIZE}")
+                                if ESP32_STREAM_QUALITY:
+                                    await _esp32_send_camera_cmd(f"SET:QUALITY={int(ESP32_STREAM_QUALITY)}")
+                                await _esp32_send_camera_cmd(f"SET:FPS={int(ESP32_STREAM_FPS)}")
+                                print("[CAMERA] sent stream kick (SET:*)", flush=True)
+                            except Exception:
+                                pass
+                    # Ignore non-frame text messages.
+                    continue
+
             if "bytes" in msg and msg["bytes"] is not None:
+                camera_rx_bytes_count += 1
                 data = msg["bytes"]
-                last_rx_t = time.monotonic()
+
+                # JPEG validity check (cheap marker heuristics):
+                # - Must start with SOI (FFD8) and end with EOI (FFD9)
+                # - Must contain SOF (FFC0/FFC2) + SOS (FFDA)
+                # - Must contain quantization (FFDB) + Huffman tables (FFC4)
+                # Missing any of these often triggers "JPEG decode failed" on the browser.
+                try:
+                    has_soi = data.startswith(b"\xff\xd8")
+                    has_eoi = data.endswith(b"\xff\xd9")
+                    has_sof = (b"\xff\xc0" in data) or (b"\xff\xc2" in data)
+                    has_sos = (b"\xff\xda" in data)
+                    has_dqt = (b"\xff\xdb" in data)
+                    has_dht = (b"\xff\xc4" in data)
+                    if not (has_soi and has_eoi and has_sof and has_sos and has_dqt and has_dht):
+                        missing: list[str] = []
+                        if not has_soi:
+                            missing.append("SOI")
+                        if not has_eoi:
+                            missing.append("EOI")
+                        if not has_sof:
+                            missing.append("SOF")
+                        if not has_sos:
+                            missing.append("SOS")
+                        if not has_dqt:
+                            missing.append("DQT")
+                        if not has_dht:
+                            missing.append("DHT")
+                        camera_rx_invalid_jpeg_count += 1
+                        camera_rx_last_invalid_jpeg_reason = "missing " + "+".join(missing)
+                        camera_rx_last_frame_size = int(len(data))
+                        continue
+                except Exception:
+                    # If validation fails unexpectedly, do not block the stream.
+                    pass
+
+                last_frame_t = time.monotonic()
+                camera_rx_last_frame_t = last_frame_t
+                camera_rx_last_frame_size = int(len(data))
 
                 # If we're in a SNAP:HQ window, capture this JPEG as the snapshot.
                 if _esp32_snapshot_active:
@@ -1471,8 +917,6 @@ async def ws_camera_esp(ws: WebSocket):
 
                 frame_counter += 1
 
-                prof_t0 = time.perf_counter() if CAMERA_PROFILE else 0.0
-
                 if frame_counter == 1:
                     print(f"[CAMERA] first frame received: {len(data)} bytes", flush=True)
                 now_t = time.monotonic()
@@ -1481,18 +925,6 @@ async def ws_camera_esp(ws: WebSocket):
                     print(f"[CAMERA] recv fps≈{fps:.1f} (frame={frame_counter})", flush=True)
                     last_log_t = now_t
                 
-                # 【新增】录制原始帧
-                rec_dt = 0.0
-                if ENABLE_RECORDER and CAMERA_RECORD_ENABLED:
-                    try:
-                        t_rec0 = time.perf_counter() if CAMERA_PROFILE else 0.0
-                        sync_recorder.record_frame(data)
-                        if CAMERA_PROFILE:
-                            rec_dt = (time.perf_counter() - t_rec0)
-                    except Exception as e:
-                        if frame_counter % 100 == 0:  # 避免日志刷屏
-                            print(f"[RECORDER] 录制帧失败: {e}")
-                
                 try:
                     last_frames.append((time.time(), data))
                 except Exception:
@@ -1500,127 +932,28 @@ async def ws_camera_esp(ws: WebSocket):
                 
                 # 推送到bridge_io（供yolomedia使用）
                 bridge_io.push_raw_jpeg(data)
-                
-                # 【调试】检查导航条件
-                if frame_counter % 30 == 0:  # 每30帧输出一次
-                    state_dbg = orchestrator.get_state() if orchestrator else "N/A"
-                    print(f"[NAVIGATION DEBUG] 帧:{frame_counter}, state={state_dbg}, yolomedia_running={yolomedia_running}")
-                
-                # 只在需要时解码：导航处理需要BGR；否则可直接转发原始JPEG给viewer
-                dec_dt = 0.0
-                bgr = None
-                need_bgr = bool(orchestrator and (not yolomedia_running))
-                if need_bgr:
-                    try:
-                        t_dec0 = time.perf_counter() if CAMERA_PROFILE else 0.0
-                        arr = np.frombuffer(data, dtype=np.uint8)
-                        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                        if CAMERA_PROFILE:
-                            dec_dt = (time.perf_counter() - t_dec0)
-                        if bgr is None or bgr.size == 0:
-                            if frame_counter % 30 == 0:
-                                print(f"[JPEG] 解码失败：数据长度={len(data)}")
-                            bgr = None
-                    except Exception as e:
-                        if frame_counter % 30 == 0:
-                            print(f"[JPEG] 解码异常: {e}")
-                        bgr = None
 
-                # 【托管】优先交给统领状态机（寻物未占用画面时）
-                # 【修改】找物品模式时不执行导航处理，让yolomedia接管画面
-                if orchestrator and not yolomedia_running and bgr is not None:
-                    current_state = orchestrator.get_state()
-                    
-                    # 【新增】找物品模式：不处理画面，等待yolomedia发送处理后的帧
-                    if current_state == "ITEM_SEARCH":
-                        # 找物品模式：若yolomedia尚未开始发送，就直接转发ESP32原始JPEG（避免额外编解码）
-                        if (not yolomedia_sending_frames) and camera_viewers:
-                            if VIEWER_SEND_RAW_JPEG:
-                                _viewer_set_latest(data)
-                            else:
-                                ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                                if ok:
-                                    _viewer_set_latest(enc.tobytes())
-                        continue  # 跳过后续的导航处理
-                    
-                    out_img = bgr
-                    proc_dt = 0.0
-                    enc_dt = 0.0
-                    try:
-                        # 【新增】检查是否在红绿灯检测模式
-                        if current_state == "TRAFFIC_LIGHT_DETECTION":
-                            # 红绿灯检测模式：在主线程中直接处理，避免掉帧
-                            import trafficlight_detection
-                            t_p0 = time.perf_counter() if CAMERA_PROFILE else 0.0
-                            result = trafficlight_detection.process_single_frame(bgr, ui_broadcast_callback=ui_broadcast_final)
-                            if CAMERA_PROFILE:
-                                proc_dt = (time.perf_counter() - t_p0)
-                            out_img = result['vis_image'] if result['vis_image'] is not None else bgr
-                        else:
-                            # 其他模式：正常的导航处理
-                            t_p0 = time.perf_counter() if CAMERA_PROFILE else 0.0
-                            res = orchestrator.process_frame(bgr)
-                            if CAMERA_PROFILE:
-                                proc_dt = (time.perf_counter() - t_p0)
-
-                            # 语音引导（内部已节流）
-                            # 注：omni对话时已切换到CHAT模式，不会生成导航语音
-                            if res.guidance_text:
-                                try:
-                                    # 先播放语音，再广播到UI
-                                    play_voice_text(res.guidance_text)
-                                    await ui_broadcast_final(f"[导航] {res.guidance_text}")
-                                except Exception:
-                                    pass
-
-                            # 输出图像
-                            out_img = res.annotated_image if res.annotated_image is not None else bgr
-                    except Exception as e:
-                        if frame_counter % 100 == 0:
-                            print(f"[NAV MASTER] 处理帧时出错: {e}")
-
-                    # 广播图像
-                    if camera_viewers and out_img is not None:
-                        t_e0 = time.perf_counter() if CAMERA_PROFILE else 0.0
-                        ok, enc = cv2.imencode(".jpg", out_img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                        if CAMERA_PROFILE:
-                            enc_dt = (time.perf_counter() - t_e0)
-                        if ok:
-                            _viewer_set_latest(enc.tobytes())
-
-                    if CAMERA_PROFILE and (frame_counter % 120 == 0):
-                        total_dt = (time.perf_counter() - prof_t0)
-                        print(
-                            f"[CAMERA PROF] frame={frame_counter} rec={rec_dt*1000:.1f}ms dec={dec_dt*1000:.1f}ms "
-                            f"proc={proc_dt*1000:.1f}ms enc={enc_dt*1000:.1f}ms total={total_dt*1000:.1f}ms viewers={len(camera_viewers)}",
-                            flush=True,
-                        )
-                    # 已托管，进入下一帧
-                    continue
-
-                # 【回退】寻物占用或者未解码成功，按原始画面回传
-                if (not yolomedia_sending_frames) and camera_viewers:
+                # When YOLO (Cards) is actively sending frames, let yolomedia own the viewer.
+                # Otherwise forward the raw ESP32 JPEG to the viewer.
+                yolo_active = bool(
+                    yolomedia_sending_frames
+                    and (_yolomedia_last_frame_t > 0.0)
+                    and ((time.monotonic() - _yolomedia_last_frame_t) <= YOLO_FRAME_STALE_SEC)
+                )
+                if (not yolo_active) and camera_viewers:
                     try:
                         if VIEWER_SEND_RAW_JPEG:
                             _viewer_set_latest(data)
                         else:
-                            if bgr is None:
-                                arr = np.frombuffer(data, dtype=np.uint8)
-                                bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                            if bgr is not None:
+                            arr = np.frombuffer(data, dtype=np.uint8)
+                            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                            if bgr is not None and bgr.size > 0:
                                 ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                                 if ok:
                                     _viewer_set_latest(enc.tobytes())
                     except Exception as e:
                         if frame_counter % 60 == 0:
                             print(f"[CAMERA] Broadcast error: {e}")
-
-                if CAMERA_PROFILE and (frame_counter % 120 == 0):
-                    total_dt = (time.perf_counter() - prof_t0)
-                    print(
-                        f"[CAMERA PROF] frame={frame_counter} rec={rec_dt*1000:.1f}ms total={total_dt*1000:.1f}ms viewers={len(camera_viewers)} raw={int(VIEWER_SEND_RAW_JPEG)}",
-                        flush=True,
-                    )
 
             elif "type" in msg and msg["type"] in ("websocket.close", "websocket.disconnect"):
                 break
@@ -1635,16 +968,8 @@ async def ws_camera_esp(ws: WebSocket):
         except Exception:
             pass
         esp32_camera_ws = None
+        camera_rx_connected = False
         print("[CAMERA] ESP32 disconnected")
-        
-        # 【新增】清理导航状态
-        if blind_path_navigator:
-            blind_path_navigator.reset()
-        if cross_street_navigator:
-            cross_street_navigator.reset()
-        if orchestrator:
-            orchestrator.reset()
-            print("[NAV MASTER] 统领器已重置")
 
 # ---------- WebSocket：浏览器订阅相机帧 ----------
 @app.websocket("/ws/viewer")
@@ -1685,161 +1010,6 @@ async def ws_viewer(ws: WebSocket):
         except Exception: 
             pass
         print(f"[VIEWER] Removed. Total viewers: {len(camera_viewers)}", flush=True)
-
-# ---------- WebSocket：浏览器订阅 IMU ----------
-@app.websocket("/ws")
-async def ws_imu(ws: WebSocket):
-    await ws.accept()
-    imu_ws_clients.add(ws)
-    try:
-        while True:
-            await asyncio.sleep(60)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        imu_ws_clients.discard(ws)
-
-async def imu_broadcast(msg: str):
-    if not imu_ws_clients: return
-    dead = []
-    for ws in list(imu_ws_clients):
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        imu_ws_clients.discard(ws)
-
-# ---------- 服务端 IMU 估计（原样保留） ----------
-from math import atan2, hypot, pi
-GRAV_BETA   = 0.98
-STILL_W     = 0.4
-YAW_DB      = 0.08
-YAW_LEAK    = 0.2
-ANG_EMA     = 0.15
-AUTO_REZERO = True
-USE_PROJ    = True
-FREEZE_STILL= True
-G     = 9.807
-A_TOL = 0.08 * G
-gLP = {"x":0.0, "y":0.0, "z":0.0}
-gOff= {"x":0.0, "y":0.0, "z":0.0}
-BIAS_ALPHA = 0.002
-yaw  = 0.0
-Rf = Pf = Yf = 0.0
-ref = {"roll":0.0, "pitch":0.0, "yaw":0.0}
-holdStart = 0.0
-isStill   = False
-last_ts_imu = 0.0
-last_wall = 0.0
-imu_store: List[Dict[str, Any]] = []
-
-def _wrap180(a: float) -> float:
-    a = a % 360.0
-    if a >= 180.0: a -= 360.0
-    if a < -180.0: a += 360.0
-    return a
-
-def process_imu_and_maybe_store(d: Dict[str, Any]):
-    global gLP, gOff, yaw, Rf, Pf, Yf, ref, holdStart, isStill, last_ts_imu, last_wall
-
-    t_ms = float(d.get("ts", 0.0))
-    now_wall = time.monotonic()
-    if t_ms <= 0.0:
-        t_ms = (now_wall * 1000.0)
-    if last_ts_imu <= 0.0 or t_ms <= last_ts_imu or (t_ms - last_ts_imu) > 3000.0:
-        dt = 0.02
-    else:
-        dt = (t_ms - last_ts_imu) / 1000.0
-    last_ts_imu = t_ms
-
-    ax = float(((d.get("accel") or {}).get("x", 0.0)))
-    ay = float(((d.get("accel") or {}).get("y", 0.0)))
-    az = float(((d.get("accel") or {}).get("z", 0.0)))
-    wx = float(((d.get("gyro")  or {}).get("x", 0.0)))
-    wy = float(((d.get("gyro")  or {}).get("y", 0.0)))
-    wz = float(((d.get("gyro")  or {}).get("z", 0.0)))
-
-    gLP["x"] = GRAV_BETA * gLP["x"] + (1.0 - GRAV_BETA) * ax
-    gLP["y"] = GRAV_BETA * gLP["y"] + (1.0 - GRAV_BETA) * ay
-    gLP["z"] = GRAV_BETA * gLP["z"] + (1.0 - GRAV_BETA) * az
-    gmag = hypot(gLP["x"], gLP["y"], gLP["z"]) or 1.0
-    gHat = {"x": gLP["x"]/gmag, "y": gLP["y"]/gmag, "z": gLP["z"]/gmag}
-
-    roll  = (atan2(az, ay)   * 180.0 / pi)
-    pitch = (atan2(-ax, ay)  * 180.0 / pi)
-
-    aNorm = hypot(ax, ay, az); wNorm = hypot(wx, wy, wz)
-    nearFlat = (abs(roll) < 2.0 and abs(pitch) < 2.0)
-    stillCond = (abs(aNorm - G) < A_TOL) and (wNorm < STILL_W)
-
-    if stillCond:
-        if holdStart <= 0.0: holdStart = t_ms
-        if not isStill and (t_ms - holdStart) > 350.0: isStill = True
-        gOff["x"] = (1.0 - BIAS_ALPHA)*gOff["x"] + BIAS_ALPHA*wx
-        gOff["y"] = (1.0 - BIAS_ALPHA)*gOff["y"] + BIAS_ALPHA*wy
-        gOff["z"] = (1.0 - BIAS_ALPHA)*gOff["z"] + BIAS_ALPHA*wz
-    else:
-        holdStart = 0.0; isStill = False
-
-    if USE_PROJ:
-        yawdot = ((wx - gOff["x"])*gHat["x"] + (wy - gOff["y"])*gHat["y"] + (wz - gOff["z"])*gHat["z"])
-    else:
-        yawdot = (wy - gOff["y"])
-
-    if abs(yawdot) < YAW_DB: yawdot = 0.0
-    if FREEZE_STILL and stillCond: yawdot = 0.0
-
-    yaw = _wrap180(yaw + yawdot * dt)
-
-    if (YAW_LEAK > 0.0) and nearFlat and stillCond and abs(yaw) > 0.0:
-        step = YAW_LEAK * dt * (-1.0 if yaw > 0 else (1.0 if yaw < 0 else 0.0))
-        if abs(yaw) <= abs(step): yaw = 0.0
-        else: yaw += step
-
-    global Rf, Pf, Yf, ref, last_wall
-    Rf = ANG_EMA * roll  + (1.0 - ANG_EMA) * Rf
-    Pf = ANG_EMA * pitch + (1.0 - ANG_EMA) * Pf
-    Yf = ANG_EMA * yaw   + (1.0 - ANG_EMA) * Yf
-
-    if AUTO_REZERO and nearFlat and (wNorm < STILL_W):
-        if holdStart <= 0.0: holdStart = t_ms
-        if not isStill and (t_ms - holdStart) > 350.0:
-            ref.update({"roll": Rf, "pitch": Pf, "yaw": Yf})
-            isStill = True
-
-    R = _wrap180(Rf - ref["roll"])
-    P = _wrap180(Pf - ref["pitch"])
-    Y = _wrap180(Yf - ref["yaw"])
-
-    now_wall = time.monotonic()
-    if last_wall <= 0.0 or (now_wall - last_wall) >= 0.100:
-        last_wall = now_wall
-        item = {
-            "ts": t_ms/1000.0,
-            "angles": {"roll": R, "pitch": P, "yaw": Y},
-            "accel":  {"x": ax, "y": ay, "z": az},
-            "gyro":   {"x": wx, "y": wy, "z": wz},
-        }
-        imu_store.append(item)
-
-# ---------- UDP 接收 IMU 并转发 ----------
-class UDPProto(asyncio.DatagramProtocol):
-    def connection_made(self, transport):
-        print(f"[UDP] listening on {UDP_IP}:{UDP_PORT}")
-    def datagram_received(self, data, addr):
-        try:
-            s = data.decode('utf-8', errors='ignore').strip()
-            d = json.loads(s)
-            if 'ts' not in d and 'timestamp_ms' in d:
-                d['ts'] = d.pop('timestamp_ms')
-            process_imu_and_maybe_store(d)
-            asyncio.create_task(imu_broadcast(json.dumps(d)))
-        except Exception:
-            pass
-
-
-
 # === 新增：注册给 bridge_io 的发送回调（把 JPEG 广播给 /ws/viewer） ===
 @app.on_event("startup")
 async def on_startup_register_bridge_sender():
@@ -1854,10 +1024,13 @@ async def on_startup_register_bridge_sender():
                 return
             
             # 标记YOLO已经开始发送处理后的帧
-            global yolomedia_sending_frames
+            global yolomedia_sending_frames, _yolomedia_last_frame_t
             if not yolomedia_sending_frames:
                 yolomedia_sending_frames = True
                 print("[YOLOMEDIA] 开始发送处理后的帧，切换到YOLO画面", flush=True)
+
+            # Track latest YOLO frame time for stale fallback logic
+            _yolomedia_last_frame_t = time.monotonic()
             
             # 不在这里直接广播（慢client会堆积任务导致卡死）；只更新最新帧
             main_loop.call_soon_threadsafe(_viewer_set_latest, jpeg_bytes)
@@ -1869,47 +1042,13 @@ async def on_startup_register_bridge_sender():
     bridge_io.set_sender(_sender)
 
 @app.on_event("startup")
-async def on_startup_init_audio():
-    """启动时初始化音频系统"""
-    if not ENABLE_AUDIO_SYSTEM:
-        print("[AUDIO] 已跳过音频系统初始化（ENABLE_AUDIO_SYSTEM=0 / LITE_MODE=1）")
-        return
-    # 在后台线程中初始化，避免阻塞启动
-    def _init():
-        try:
-            initialize_audio_system()
-        except Exception as e:
-            print(f"[AUDIO] 初始化失败: {e}")
-    
-    threading.Thread(target=_init, daemon=True).start()
-
-@app.on_event("startup")
 async def on_startup():
-    loop = asyncio.get_running_loop()
-    if ENABLE_UDP:
-        try:
-            await loop.create_datagram_endpoint(lambda: UDPProto(), local_addr=(UDP_IP, UDP_PORT))
-            print(f"[UDP] listening on {UDP_IP}:{UDP_PORT}")
-        except OSError as e:
-            print(f"[UDP] bind failed: {e!s}. Continuing without UDP listener.")
-            print(f"[UDP] If you need UDP, either free the port or set UDP_PORT to another value and restart.")
-    else:
-        print("[UDP] 已跳过 UDP listener（ENABLE_UDP=0 / LITE_MODE=1）")
-
     # Start viewer broadcaster (latest-frame only)
     global viewer_new_frame_evt, viewer_broadcast_task
     if viewer_new_frame_evt is None:
         viewer_new_frame_evt = asyncio.Event()
     if viewer_broadcast_task is None or viewer_broadcast_task.done():
         viewer_broadcast_task = asyncio.create_task(_viewer_broadcast_loop())
-
-    # Auto-start vision agent (llava) if enabled
-    if AGENT_AUTOSTART:
-        try:
-            agent = _ensure_vision_agent()
-            asyncio.create_task(agent.start())
-        except Exception as e:
-            print(f"[AGENT] autostart failed: {e}", flush=True)
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -1926,10 +1065,7 @@ async def on_shutdown():
     
     # 停止YOLO媒体处理
     stop_yolomedia()
-    
-    # 停止音频和AI任务
-    await hard_reset_audio("shutdown")
-    
+
     print("[SHUTDOWN] 资源清理完成")
 
 # app_main.py —— 在文件里已有的 @app.on_event("startup") 之后，再加一个新的 startup 钩子

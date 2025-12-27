@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_camera.h>
+#include <esp_system.h>
 #include <ArduinoWebsockets.h>
 #include "ESP_I2S.h"
 #include "freertos/FreeRTOS.h"
@@ -16,6 +17,11 @@ struct WavFmt;
 #include <SPI.h>        // <<< 改成 SPI
 #include <esp_heap_caps.h>
 using namespace websockets;
+
+// Some ESP32-S3 board configs route `Serial` to USB CDC, which may not show up
+// on the same /dev/cu.* device that prints ROM boot logs. Use ets_printf for
+// a reliable UART0-level log channel.
+extern "C" int ets_printf(const char* fmt, ...);
 
 // ====================================================================
 // Feature flags (image-only mode)
@@ -79,8 +85,16 @@ volatile int g_target_fps = 0; // 新增：0=不限，>0 则按该FPS限速发�
 volatile unsigned long frame_captured_count = 0;  // 采集帧计数
 volatile unsigned long frame_sent_count = 0;      // 发送帧计数
 volatile unsigned long frame_dropped_count = 0;   // 丢弃帧计数
+volatile unsigned long frame_capture_fail_total = 0; // 采集/拷贝失败累计
 volatile unsigned long last_stats_time = 0;       // 上次统计时间
 volatile unsigned long ws_send_fail_count = 0;    // WebSocket发送失败计数
+
+// ===== Stream stability knobs =====
+// Server closes the socket if it sees no WS messages for ~30s.
+// Keep sending a tiny text keepalive so the connection stays healthy even
+// during brief camera capture gaps.
+static const unsigned long CAM_WS_KEEPALIVE_MS = 8000;     // text keepalive interval
+static const unsigned long CAM_WS_FORCE_RECONNECT_MS = 20000; // if no send for this long, reconnect
 
 // ===== Mic (PDM RX) =====
 #define I2S_MIC_CLOCK_PIN 42
@@ -174,17 +188,21 @@ bool init_camera() {
   config.pin_sscb_sda = SIOD_GPIO_NUM; config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn  = PWDN_GPIO_NUM; config.pin_reset = RESET_GPIO_NUM;
 
-  // lower XCLK to reduce stress on clock/PP memory allocations on constrained boards
-  config.xclk_freq_hz = 10000000;
+  // XCLK too low can lead to unstable / corrupt JPEG streams on some sensors/boards.
+  // 20MHz is the common stable default for OV2640-class modules.
+  config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size   = g_frame_size;
   config.jpeg_quality = JPEG_QUALITY;
-  g_cam_fb_count      = psramFound() ? 3 : 1;
+  // With only 1 framebuffer, CAMERA_GRAB_LATEST can starve esp_camera_fb_get().
+  // Use at least 2 buffers even without PSRAM (QVGA JPEG fits DRAM), and more
+  // when PSRAM is available.
+  g_cam_fb_count      = psramFound() ? 3 : 2;
   config.fb_count     = g_cam_fb_count;
   // Prefer PSRAM if available to reduce DRAM pressure and improve stability.
   // Falls back to DRAM for variants without PSRAM.
   config.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
-  config.grab_mode    = CAMERA_GRAB_LATEST;
+  config.grab_mode    = (config.fb_count > 1) ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) { Serial.printf("[CAM] init failed: 0x%x\n", err); return false; }
@@ -206,6 +224,28 @@ bool init_camera() {
     s->set_aec_value(s, 40);
   }
   return true;
+}
+
+static inline bool jpeg_has_marker(const uint8_t* p, size_t n, uint8_t marker) {
+  if (!p || n < 4) return false;
+  // Scan for 0xFF <marker>. This is safe for our small frames.
+  for (size_t i = 0; i + 1 < n; ++i) {
+    if (p[i] == 0xFF && p[i + 1] == marker) return true;
+  }
+  return false;
+}
+
+static inline bool jpeg_seems_decodable(const uint8_t* jpg, size_t jpg_len) {
+  if (!jpg || jpg_len < 4) return false;
+  if (!(jpg[0] == 0xFF && jpg[1] == 0xD8)) return false;               // SOI
+  if (!(jpg[jpg_len - 2] == 0xFF && jpg[jpg_len - 1] == 0xD9)) return false; // EOI
+  // Require Start Of Frame (baseline/progressive) + Start Of Scan.
+  bool has_sof = jpeg_has_marker(jpg, jpg_len, 0xC0) || jpeg_has_marker(jpg, jpg_len, 0xC2);
+  bool has_sos = jpeg_has_marker(jpg, jpg_len, 0xDA);
+  // Require quantization + Huffman tables; missing tables often decode-fail.
+  bool has_dqt = jpeg_has_marker(jpg, jpg_len, 0xDB);
+  bool has_dht = jpeg_has_marker(jpg, jpg_len, 0xC4);
+  return has_sof && has_sos && has_dqt && has_dht;
 }
 
 inline void free_frame(frame_ptr_t f) {
@@ -237,6 +277,10 @@ inline void enqueue_frame(frame_ptr_t f) {
 void taskCamCapture(void*) {
   unsigned long last_log = 0;
   unsigned long capture_fail_count = 0;
+  unsigned long consecutive_fail = 0;
+  unsigned long last_reinit_ms = 0;
+  const unsigned long CAM_REINIT_COOLDOWN_MS = 5000;
+  const unsigned long CAM_REINIT_FAIL_THRESHOLD = 250; // consecutive failures before reinit
   
   for(;;){
     if (snapshot_in_progress) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
@@ -248,12 +292,15 @@ void taskCamCapture(void*) {
         if (fb->format != PIXFORMAT_JPEG || fb->len == 0 || fb->buf == nullptr) {
           esp_camera_fb_return(fb);
           capture_fail_count++;
+          frame_capture_fail_total++;
         } else {
           // Copy the JPEG payload so the camera buffer can be returned immediately.
           frame_ptr_t f = (frame_ptr_t)malloc(sizeof(JpegFrame));
           if (!f) {
+            consecutive_fail = 0;
             esp_camera_fb_return(fb);
             capture_fail_count++;
+            frame_capture_fail_total++;
           } else {
             f->len = fb->len;
             // Prefer PSRAM for larger buffers when available.
@@ -263,6 +310,7 @@ void taskCamCapture(void*) {
               free(f);
               esp_camera_fb_return(fb);
               capture_fail_count++;
+              frame_capture_fail_total++;
             } else {
               memcpy(f->buf, fb->buf, f->len);
               esp_camera_fb_return(fb);
@@ -272,6 +320,27 @@ void taskCamCapture(void*) {
         }
       } else {
         capture_fail_count++;
+        frame_capture_fail_total++;
+        consecutive_fail++;
+
+        // If camera starts failing persistently, try a soft re-init.
+        unsigned long now_ms = millis();
+        if (consecutive_fail >= CAM_REINIT_FAIL_THRESHOLD && (now_ms - last_reinit_ms) > CAM_REINIT_COOLDOWN_MS) {
+          last_reinit_ms = now_ms;
+          Serial.printf("[CAM] too many capture fails (%lu). Reinitializing camera...\n", consecutive_fail);
+          ets_printf("[CAM] too many capture fails (%lu). Reinitializing camera...\n", (unsigned long)consecutive_fail);
+          // Best-effort restart.
+          esp_camera_deinit();
+          vTaskDelay(pdMS_TO_TICKS(200));
+          if (!init_camera()) {
+            Serial.println("[CAM] reinit failed");
+            ets_printf("[CAM] reinit failed\n");
+          } else {
+            Serial.println("[CAM] reinit OK");
+            ets_printf("[CAM] reinit OK\n");
+          }
+          consecutive_fail = 0;
+        }
         vTaskDelay(pdMS_TO_TICKS(2));
       }
       
@@ -281,6 +350,10 @@ void taskCamCapture(void*) {
         int queue_waiting = uxQueueMessagesWaiting(qFrames);
         Serial.printf("[CAM-CAP] captured=%lu, queue=%d, fail=%lu\n", 
                       frame_captured_count, queue_waiting, capture_fail_count);
+        ets_printf("[CAM-CAP] captured=%lu queue=%d fail=%lu\n",
+                   (unsigned long)frame_captured_count,
+                   (int)queue_waiting,
+                   (unsigned long)capture_fail_count);
         last_log = now;
         capture_fail_count = 0;  // 重置失败计数
       }
@@ -295,6 +368,7 @@ void taskWsCamLoop(void*) {
   static TickType_t lastTick = 0;
   unsigned long last_log = 0;
   unsigned long last_sent_time = 0;
+  unsigned long last_keepalive = 0;
 
   for (;;) {
     // If WiFi is down, ensure socket closed and drop frames quickly.
@@ -356,6 +430,7 @@ void taskWsCamLoop(void*) {
     }
 
     frame_ptr_t f = nullptr;
+    bool sent_any = false;
     if (xQueueReceive(qFrames, &f, pdMS_TO_TICKS(20)) == pdPASS && f) {
       // FPS throttle
       if (g_target_fps > 0) {
@@ -389,8 +464,34 @@ void taskWsCamLoop(void*) {
         free_frame(f);
         continue;
       }
+
+      // Some camera drivers append padding after EOI. If the buffer doesn't end
+      // with 0xFFD9, search for the last EOI and truncate.
       if (!(jpg[jpg_len - 2] == 0xFF && jpg[jpg_len - 1] == 0xD9)) {
+        int last_eoi = -1;
+        // Search backwards (fast path) within a reasonable tail window.
+        size_t start = (jpg_len > 2048) ? (jpg_len - 2048) : 0;
+        for (size_t i = jpg_len - 2; i + 1 > start; --i) {
+          if (jpg[i] == 0xFF && jpg[i + 1] == 0xD9) { last_eoi = (int)i; break; }
+        }
+        if (last_eoi >= 0) {
+          jpg_len = (size_t)last_eoi + 2;
+        } else {
+          frame_dropped_count++;
+          free_frame(f);
+          continue;
+        }
+      }
+
+      // More strict check: must contain SOF + SOS, otherwise decoders will fail.
+      if (!jpeg_seems_decodable(jpg, jpg_len)) {
         frame_dropped_count++;
+        static unsigned long bad_log = 0;
+        unsigned long now = millis();
+        if (now - bad_log > 3000) {
+          Serial.printf("[CAM] drop invalid JPEG (missing SOF/SOS?) len=%u\n", (unsigned)jpg_len);
+          bad_log = now;
+        }
         free_frame(f);
         continue;
       }
@@ -401,6 +502,7 @@ void taskWsCamLoop(void*) {
       if (ok) {
         frame_sent_count++;
         last_sent_time = millis();
+        sent_any = true;
         if (send_time > 100) {
           Serial.printf("[CAM-SEND] WARNING: send took %lu ms (size=%u)\n", send_time, (unsigned)jpg_len);
         }
@@ -417,14 +519,48 @@ void taskWsCamLoop(void*) {
       free_frame(f);
     }
 
+    // Keepalive: send a tiny text message periodically so server won't
+    // consider the connection stalled during brief camera hiccups.
+    unsigned long now_ms = millis();
+    if (cam_ws_ready && (now_ms - last_keepalive) >= CAM_WS_KEEPALIVE_MS) {
+      last_keepalive = now_ms;
+      bool ok = wsCam.send("KA");
+      if (ok) {
+        last_sent_time = now_ms;
+        sent_any = true;
+      } else {
+        ws_send_fail_count++;
+        Serial.println("[WS-CAM] keepalive send failed, closing...");
+        if (wsCam.available()) wsCam.close();
+        cam_ws_ready = false;
+        g_wsCamAvailSnap = 0;
+        lastWsCamAttempt = millis();
+        wsCam_backoff_ms = min(wsCam_backoff_ms * 2, wsCam_backoff_max);
+      }
+    }
+
+    // Watchdog: if we haven't been able to send anything for too long,
+    // force reconnect to break half-open socket states.
+    if (cam_ws_ready) {
+      unsigned long gap = (last_sent_time > 0) ? (now_ms - last_sent_time) : 0;
+      if (gap >= CAM_WS_FORCE_RECONNECT_MS) {
+        Serial.printf("[WS-CAM] no sends for %lu ms, forcing reconnect...\n", gap);
+        ets_printf("[WS-CAM] no sends for %lu ms, forcing reconnect...\n", (unsigned long)gap);
+        if (wsCam.available()) wsCam.close();
+        cam_ws_ready = false;
+        g_wsCamAvailSnap = 0;
+        lastWsCamAttempt = millis();
+        wsCam_backoff_ms = min(wsCam_backoff_ms * 2, wsCam_backoff_max);
+      }
+    }
+
     // stats log
-    unsigned long now = millis();
-    if (now - last_log > 5000) {
-      unsigned long gap = (last_sent_time > 0) ? (now - last_sent_time) : 0;
+    if (now_ms - last_log > 5000) {
+      unsigned long gap = (last_sent_time > 0) ? (now_ms - last_sent_time) : 0;
       Serial.printf("[CAM] sent=%lu, dropped=%lu, ws_fail=%lu, q=%u, last_gap=%lu ms\n",
                     frame_sent_count, frame_dropped_count, ws_send_fail_count,
                     (unsigned)uxQueueMessagesWaiting(qFrames), gap);
-      last_log = now;
+      last_log = now_ms;
     }
 
     vTaskDelay(pdMS_TO_TICKS(2));
@@ -1082,12 +1218,22 @@ void taskImuLoop(void*){
 // ====================================================================
 void setup() {
   Serial.begin(115200);
-  delay(1500);
+  // Some ESP32-S3 USB-Serial/JTAG setups drop initial bytes right after reset.
+  // Emit a short heartbeat so we can reliably confirm the sketch is running.
+  for (int i = 0; i < 10; i++) {
+    delay(200);
+    Serial.println(".");
+  }
   Serial.println();
   Serial.println("[BOOT] XIAO ESP32S3 firmware start");
+  Serial.printf("[BOOT] reset_reason=%d\n", (int)esp_reset_reason());
   Serial.printf("[BOOT] target server ws: ws://%s:%u%s\n", SERVER_HOST, SERVER_PORT, CAM_WS_PATH);
+  ets_printf("\n[BOOT] XIAO ESP32S3 firmware start\n");
+  ets_printf("[BOOT] reset_reason=%d\n", (int)esp_reset_reason());
+  ets_printf("[BOOT] target server ws: ws://%s:%u%s\n", SERVER_HOST, (unsigned)SERVER_PORT, CAM_WS_PATH);
   #if ENABLE_AUDIO
   Serial.printf("[BOOT] target server aud: ws://%s:%u%s\n", SERVER_HOST, SERVER_PORT, AUD_WS_PATH);
+  ets_printf("[BOOT] target server aud: ws://%s:%u%s\n", SERVER_HOST, (unsigned)SERVER_PORT, AUD_WS_PATH);
   #endif
   Serial.flush();
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info){
@@ -1106,7 +1252,27 @@ void setup() {
   while (WiFi.status()!=WL_CONNECTED){ delay(300); Serial.print("."); }
   Serial.println(" OK " + WiFi.localIP().toString());
 
-  if (!init_camera()) { Serial.println("[CAM] init failed, reboot..."); delay(1500); esp_restart(); }
+  if (!init_camera()) {
+    Serial.println("[CAM] init failed (will not reboot-loop). Check camera wiring/pins/board.");
+    Serial.flush();
+    // Stay alive so serial monitor can capture logs on boards without buttons.
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  // Camera warmup: capture a few frames immediately so we can confirm the camera
+  // actually produces JPEG buffers on this board/config.
+  for (int i = 0; i < 3; i++) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb) {
+      ets_printf("[CAM-WARM] %d ok len=%u fmt=%d\n", i, (unsigned)fb->len, (int)fb->format);
+      esp_camera_fb_return(fb);
+    } else {
+      ets_printf("[CAM-WARM] %d FAIL\n", i);
+    }
+    delay(200);
+  }
 
   #if ENABLE_UDP
   udp.begin(0);
@@ -1274,6 +1440,26 @@ void loop() {
         (unsigned long)wsCam_backoff_ms
       );
       Serial.flush();
+
+      // Mirror heartbeat to UART0-level logging so we can always observe state.
+      unsigned q = 0;
+      if (qFrames) q = (unsigned)uxQueueMessagesWaiting(qFrames);
+      ets_printf(
+        "[HB] ms=%lu wifi=%d cam_avail=%d cam_ready=%d snap=%d heap=%u backoff=%lu q=%u cap=%lu cap_fail=%lu sent=%lu drop=%lu fail=%lu\n",
+        (unsigned long)now,
+        (int)WiFi.status(),
+        (int)camAvailSnap,
+        (int)cam_ws_ready,
+        (int)snapshot_in_progress,
+        (unsigned)ESP.getFreeHeap(),
+        (unsigned long)wsCam_backoff_ms,
+        (unsigned)q,
+        (unsigned long)frame_captured_count,
+        (unsigned long)frame_capture_fail_total,
+        (unsigned long)frame_sent_count,
+        (unsigned long)frame_dropped_count,
+        (unsigned long)ws_send_fail_count
+      );
     }
   }
 

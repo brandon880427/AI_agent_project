@@ -44,7 +44,6 @@
           const $btnReconnect = document.getElementById('btnReconnect');
           const $btnClear = document.getElementById('btnClear');
           const $btnDescribe = document.getElementById('btnDescribe');
-          const $btnAgentStep = document.getElementById('btnAgentStep');
           const $btnAgentStart = document.getElementById('btnAgentStart');
           const $btnAgentStop = document.getElementById('btnAgentStop');
           const $chat = document.getElementById('chatContainer');
@@ -279,16 +278,6 @@
               await refreshAgentStatus();
             } catch (e) {
               addMessage(`[UI] agent stop failed: ${e}`);
-            }
-          });
-
-          $btnAgentStep?.addEventListener('click', async () => {
-            addMessage('[UI] agent step', true);
-            try {
-              await postJson('/api/agent/step', {});
-              await refreshAgentStatus();
-            } catch (e) {
-              addMessage(`[UI] agent step failed: ${e}`);
             }
           });
 

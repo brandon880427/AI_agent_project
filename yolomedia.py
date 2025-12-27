@@ -13,6 +13,8 @@ YOLOv8 单类分割 + MediaPipe Hand Landmarker + 光流追踪（多边形）
 - 中文绘制优先 Pillow + 系统中文字体（避免问号）
 """
 
+from __future__ import annotations
+
 import os
 import time
 import threading
@@ -22,14 +24,24 @@ from pathlib import Path
 import shutil
 import cv2
 import numpy as np
-import mediapipe as mp
-from mediapipe.framework.formats import landmark_pb2
-from ultralytics import YOLO
-from ultralytics.utils.plotting import Colors
-import bridge_io
-import pygame  # 用于播放本地音频文件
 
-from audio_player import play_audio_threadsafe
+# Optional deps:
+# - Cards mode only needs OpenCV + Ultralytics.
+# - Other modes may require MediaPipe / plotting utils / pygame.
+try:
+    import mediapipe as mp  # type: ignore
+    from mediapipe.framework.formats import landmark_pb2  # type: ignore
+except Exception:
+    mp = None
+    landmark_pb2 = None
+
+try:
+    from ultralytics import YOLO  # type: ignore
+    from ultralytics.utils.plotting import Colors  # type: ignore
+except Exception:
+    YOLO = None
+    Colors = None
+import bridge_io
 PERF_DEBUG = False        # 打印调试信息（False 关闭）
 HAND_DOWNSCALE = 0.8      # HandLandmarker 的输入缩放 0.5=长宽各减半（≈1/4 像素量）
 HAND_FPS_DIV = 1          # 人手每 2 帧跑一次（1=每帧；2=隔帧；3=每3帧）
@@ -137,6 +149,15 @@ _CARD_SUIT_SYMBOL = {
     "clubs": "♣",
 }
 
+# OpenCV 内建字体通常无法渲染 Unicode 花色符号，会显示成 ???。
+# 在 Pillow/字体不可用时，回退为 ASCII 花色，确保“花色一定看得到”。
+_CARD_SUIT_ASCII = {
+    "spades": "S",
+    "hearts": "H",
+    "diamonds": "D",
+    "clubs": "C",
+}
+
 
 def _is_cards_prompt(prompt_name: str) -> bool:
     if not prompt_name:
@@ -242,7 +263,9 @@ def _canon_rank(rank: str) -> str:
 def _card_label_to_display(label: str) -> str:
     rank, suit = _parse_card_label_to_rank_suit(label)
     if rank and suit:
-        sym = _CARD_SUIT_SYMBOL.get(suit, "")
+        # Prefer real suit symbols when Pillow+font is available; otherwise use ASCII.
+        use_unicode = bool(_PIL_OK and _FONT_PATH)
+        sym = (_CARD_SUIT_SYMBOL.get(suit, "") if use_unicode else _CARD_SUIT_ASCII.get(suit, ""))
         return f"{rank}{sym}" if sym else f"{rank} {suit}"
     return str(label)
 
@@ -462,7 +485,7 @@ RATIO_TOL            = 0.25   # 容许偏离：±25% 内认为距离合适
 
 # ========= 语音播报 =========
 TTS_INTERVAL_SEC     = 1.0
-ENABLE_TTS           = True
+ENABLE_TTS           = False
 
 # ========= 光流（LK）与特征点 =========
 LK_PARAMS = dict(winSize=(21, 21),
@@ -487,41 +510,36 @@ TRACK_EPSILON_FACTOR = 0.003    # 追踪模式下的轮廓精度因子
 YOLO_CORRECTION_IOU_THRESHOLD = 0.2  # IoU阈值，越低越积极矫正
 YOLO_CORRECTION_CONF_THRESHOLD = 0.15  # 置信度阈值，越低检测越敏感
 
-# ========= 方向引导音频路径 =========
-AUDIO_DIR = r"E:\沙粒云\自媒体\2025视频制作\20250925AI眼镜\AI眼镜合并\audio"  # 请修改为实际路径
-AUDIO_FILES = {
-    "向上": os.path.join(AUDIO_DIR, "up.wav"),
-    "向下": os.path.join(AUDIO_DIR, "down.wav"),
-    "向左": os.path.join(AUDIO_DIR, "left.wav"),
-    "向右": os.path.join(AUDIO_DIR, "right.wav"),
-    "向前": os.path.join(AUDIO_DIR, "forward.wav"),
-    "后退": os.path.join(AUDIO_DIR, "backward.wav"),
-    "OK": os.path.join(AUDIO_DIR, "ok.wav"),  # 添加OK音效
-}
-GUIDANCE_INTERVAL_SEC = 1.5  # 引导播报间隔
-
-# 初始化pygame音频
-pygame.mixer.init()
+# ========= 方向引导（无音频）=========
+GUIDANCE_INTERVAL_SEC = 1.5  # 引导提示间隔（仅用于文字提示）
 
 # ========= 窗口 =========
 WINDOW = "YOLO Seg + Flow Polygon (Peri-Relock) (Grab Guidance)"
 
-# ======== MediaPipe 别名 ========
-BaseOptions           = mp.tasks.BaseOptions
-VisionRunningMode     = mp.tasks.vision.RunningMode
-HandLandmarker        = mp.tasks.vision.HandLandmarker
-HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-HAND_CONNECTIONS      = mp.solutions.hands.HAND_CONNECTIONS
+# ======== MediaPipe 别名（可选） ========
+if mp is not None:
+    BaseOptions = mp.tasks.BaseOptions
+    VisionRunningMode = mp.tasks.vision.RunningMode
+    HandLandmarker = mp.tasks.vision.HandLandmarker
+    HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+    HAND_CONNECTIONS = mp.solutions.hands.HAND_CONNECTIONS
+else:
+    BaseOptions = None
+    VisionRunningMode = None
+    HandLandmarker = None
+    HandLandmarkerOptions = None
+    HAND_CONNECTIONS = None
 
 # ======== HandLandmarker 回调缓存 ========
 _last_result = None  # (result, timestamp_ms)
 
-def on_result(result: mp.tasks.vision.HandLandmarkerResult,
-              output_image: mp.Image, timestamp_ms: int):
+def on_result(result, output_image, timestamp_ms: int):
     global _last_result
     _last_result = (result, timestamp_ms)
 
-def _to_proto(hand_lms) -> landmark_pb2.NormalizedLandmarkList:
+def _to_proto(hand_lms):
+    if landmark_pb2 is None:
+        raise RuntimeError("mediapipe is not available")
     proto = landmark_pb2.NormalizedLandmarkList()
     proto.landmark.extend([
         landmark_pb2.NormalizedLandmark(x=p.x, y=p.y, z=p.z) for p in hand_lms
@@ -530,6 +548,8 @@ def _to_proto(hand_lms) -> landmark_pb2.NormalizedLandmarkList:
 
 # —— 手骨架单色渲染 —— #
 def draw_hands_mono(img_bgr, hand_lms, color=(0, 255, 255), r=2, t=2):
+    if mp is None or HAND_CONNECTIONS is None:
+        return
     mp_drawing = mp.solutions.drawing_utils
     landmark_spec   = mp_drawing.DrawingSpec(color=color, thickness=-1, circle_radius=r)
     connection_spec = mp_drawing.DrawingSpec(color=color, thickness=t,  circle_radius=r)
@@ -548,39 +568,6 @@ def draw_hands_mono(img_bgr, hand_lms, color=(0, 255, 255), r=2, t=2):
 def norm_name(s: str) -> str:
     return "".join(str(s).lower().split())
 
-# ======== TTS（pyttsx3）========
-class Speaker:
-    def __init__(self, enable=True):
-        self.enable = enable
-        self._engine = None
-        self._lock = threading.Lock()
-        if enable:
-            try:
-                import pyttsx3
-                self._engine = pyttsx3.init()
-                self._engine.setProperty('rate', 190)
-                self._engine.setProperty('volume', 1.0)
-            except Exception:
-                self._engine = None
-                self.enable = False
-
-    def say_async(self, text: str):
-        if not self.enable or not text:
-            return
-        def _run():
-            try:
-                with self._lock:
-                    self._engine.stop()
-                    self._engine.say(text)
-                    self._engine.iterate()
-                    t0 = time.time()
-                    while self._engine.isBusy() and (time.time() - t0) < 1.2:
-                        self._engine.iterate()
-                        time.sleep(0.01)
-            except Exception:
-                pass
-        threading.Thread(target=_run, daemon=True).start()
-
 # ======== 中文文本绘制（优先 Pillow）========
 _PIL_OK = False
 _FONT_PATH = None
@@ -593,12 +580,26 @@ def _init_font():
         _PIL_OK = False
         return
     candidates = [
+        # Windows
         r"C:\\Windows\\Fonts\\msyh.ttc",
         r"C:\\Windows\\Fonts\\msyh.ttf",
         r"C:\\Windows\\Fonts\\simhei.ttf",
         r"C:\\Windows\\Fonts\\simfang.ttf",
         r"C:\\Windows\\Fonts\\simsun.ttc",
         r"C:\\Windows\\Fonts\\simsunb.ttf",
+        # macOS (common installations)
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "/System/Library/Fonts/Supplemental/Apple Symbols.ttf",
+        "/System/Library/Fonts/Supplemental/PingFang.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+        # Linux (common)
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
     ]
     for p in candidates:
         if os.path.exists(p):
@@ -618,8 +619,12 @@ def draw_text_cn(img_bgr, text, xy, font_size=20, color=(255,255,255), stroke=No
     font_size = int(UNIFIED_FONT_PX)
 
     H, W = img_bgr.shape[:2]
-    # 右上角堆叠布局：计算y顶边，并按文本宽度右对齐
-    y_top = _ui_next_y_top(font_size) if ui_hint else _ui_next_y_top(font_size)
+    # ui_hint=True：右上角堆叠；ui_hint=False：尊重传入坐标（用于贴近目标标注）
+    if ui_hint:
+        y_top = _ui_next_y_top(font_size)
+    else:
+        x_in, y_in = int(xy[0]), int(xy[1])
+        y_top = max(0, min(H - 1, y_in))
     # 先估算文本尺寸
     tw = th = 0
     font_obj = None
@@ -640,8 +645,15 @@ def draw_text_cn(img_bgr, text, xy, font_size=20, color=(255,255,255), stroke=No
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(img_rgb)
             draw = ImageDraw.Draw(pil_img)
-            x = max(8, W - _UI_RIGHT_MARGIN - tw)
-            y = y_top
+            if ui_hint:
+                x = max(8, W - _UI_RIGHT_MARGIN - tw)
+                y = y_top
+            else:
+                x = max(0, min(W - 1, x_in))
+                # 若贴近目标，尽量让文本在画面内
+                if x + tw > W:
+                    x = max(0, W - tw)
+                y = max(0, min(H - th, y_top))
             draw.text((x, y), text, fill=(255,255,255), font=font_obj)
             img_bgr[:] = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             return
@@ -651,8 +663,14 @@ def draw_text_cn(img_bgr, text, xy, font_size=20, color=(255,255,255), stroke=No
     if tw <= 0 or th <= 0:
         scale = font_size/24.0
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
-    x = max(8, W - _UI_RIGHT_MARGIN - int(tw))
-    y_baseline = int(y_top + th)
+    if ui_hint:
+        x = max(8, W - _UI_RIGHT_MARGIN - int(tw))
+        y_baseline = int(y_top + th)
+    else:
+        x = max(0, min(W - 1, x_in))
+        if x + int(tw) > W:
+            x = max(0, W - int(tw))
+        y_baseline = int(max(th, min(H - 1, y_top + th)))
     cv2.putText(img_bgr, text, (x, y_baseline), cv2.FONT_HERSHEY_SIMPLEX, font_size/24.0, color, 2, cv2.LINE_AA)
 
 # ======== 工具函数 ========
@@ -941,12 +959,9 @@ def get_guidance_direction(hand_center, object_center, hand_area, object_area, h
         else:
             return "保持", None
 
-# 播放音频的函数
+# 播放音频的函数（最小版禁用音频；仅更新文字提示）
 def play_guidance_audio(direction):
-    """播放方向引导音频"""
-    # 直接调用新的音频播放函数
-    play_audio_threadsafe(direction)
-    # 同步更新底部按钮的指令文本
+    """Minimal build: no audio output; only updates on-screen command text."""
     try:
         if isinstance(direction, str) and direction.strip():
             set_current_command(_display_direction(direction.strip()))
@@ -1003,7 +1018,7 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
         PROMPT_NAME = prompt_name
         print(f"[YOLOMEDIA] Using dynamic prompt: {PROMPT_NAME}")
     
-    speaker = Speaker(ENABLE_TTS)
+    speaker = None
     last_tts_ts = 0.0
     MODE = "SEGMENT"  # 模式：SEGMENT -> FLASH -> CENTER_GUIDE -> TRACK
     colors = Colors()
