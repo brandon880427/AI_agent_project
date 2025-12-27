@@ -12,19 +12,27 @@ LOG_FILE="${LOG_FILE:-server.log}"
 if [[ -f "$PID_FILE" ]]; then
   old_pid="$(cat "$PID_FILE" || true)"
   if [[ -n "${old_pid:-}" ]] && kill -0 "$old_pid" 2>/dev/null; then
-    echo "Stopping PID=$old_pid"
-    kill "$old_pid" || true
-    # give it a moment
-    for _ in {1..20}; do
+    old_args="$(ps -p "$old_pid" -o args= 2>/dev/null || true)"
+    if echo "$old_args" | grep -qE "((^|[[:space:]])(${ROOT_DIR}/)?app_main\.py([[:space:]]|$))|(uvicorn[[:space:]]+app_main:app)"; then
+      echo "Stopping PID=$old_pid"
+      kill "$old_pid" || true
+    else
+      echo "Warning: $PID_FILE points to PID=$old_pid but it does not look like app_main.py; skipping stop." >&2
+      old_pid=""
+    fi
+    if [[ -n "${old_pid:-}" ]]; then
+      # give it a moment
+      for _ in {1..20}; do
+        if kill -0 "$old_pid" 2>/dev/null; then
+          sleep 0.1
+        else
+          break
+        fi
+      done
       if kill -0 "$old_pid" 2>/dev/null; then
-        sleep 0.1
-      else
-        break
+        echo "PID $old_pid did not exit; sending SIGKILL"
+        kill -9 "$old_pid" 2>/dev/null || true
       fi
-    done
-    if kill -0 "$old_pid" 2>/dev/null; then
-      echo "PID $old_pid did not exit; sending SIGKILL"
-      kill -9 "$old_pid" 2>/dev/null || true
     fi
   fi
 fi

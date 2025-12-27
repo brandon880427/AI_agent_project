@@ -47,14 +47,485 @@ HAND_DOWNSCALE = 0.8      # HandLandmarker 的输入缩放 0.5=长宽各减半�
 HAND_FPS_DIV = 1          # 人手每 2 帧跑一次（1=每帧；2=隔帧；3=每3帧）
 
 
+# ===== Cards detections (shared with backend) =====
+_cards_last_lock = threading.Lock()
+_cards_last_t: float = 0.0
+_cards_last_dets: list[dict] = []
+_cards_last_slots: list[dict] = []
+_cards_last_hole_cards: list[str] = []
+
+
+def _bbox_iou(a, b) -> float:
+    try:
+        ax1, ay1, ax2, ay2 = [float(x) for x in a]
+        bx1, by1, bx2, by2 = [float(x) for x in b]
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        iw = max(0.0, inter_x2 - inter_x1)
+        ih = max(0.0, inter_y2 - inter_y1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        b_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        denom = a_area + b_area - inter
+        return float(inter / denom) if denom > 1e-9 else 0.0
+    except Exception:
+        return 0.0
+
+
+def get_latest_cards_dets() -> dict:
+        """Return latest cards detections from cards mode.
+
+        Shape:
+            {"t": float, "dets": [{"rank": "A", "suit": "spades", "conf": 0.8, "label": "AS", "display": "A♠", "bbox": [x1,y1,x2,y2]}]}
+
+        If cards mode hasn't produced detections yet, dets may be empty.
+        """
+        with _cards_last_lock:
+                return {
+                        "t": float(_cards_last_t),
+                        "dets": list(_cards_last_dets),
+                "slots": list(_cards_last_slots),
+                "hole_cards": list(_cards_last_hole_cards),
+                }
+
+
 # ========= 扑克牌识别（检测） =========
 # 约定：训练集的 class name 建议为：AS/10H/KD/2C 或 A_spades/10_hearts 等。
 CARDS_MODEL_PATH = os.getenv("CARDS_MODEL_PATH", os.path.join("model", "cards.pt"))
-CARDS_CONF = float(os.getenv("CARDS_CONF", "0.25"))
-CARDS_IOU = float(os.getenv("CARDS_IOU", "0.45"))
+CARDS_CONF = float(os.getenv("CARDS_CONF", "0.15"))
+# Higher IoU threshold reduces NMS suppression when two cards overlap in view.
+CARDS_IOU = float(os.getenv("CARDS_IOU", "0.65"))
 CARDS_IMGSZ = int(os.getenv("CARDS_IMGSZ", "640"))
 CARDS_INFER_EVERY = int(os.getenv("CARDS_INFER_EVERY", "1"))
-CARDS_MAX_DETS = int(os.getenv("CARDS_MAX_DETS", "30"))
+CARDS_MAX_DETS = int(os.getenv("CARDS_MAX_DETS", "50"))
+
+# Cards stabilization (hole cards tracking)
+CARDS_SLOT_TTL_SEC = float(os.getenv("CARDS_SLOT_TTL_SEC", "2.0"))
+CARDS_MATCH_IOU = float(os.getenv("CARDS_MATCH_IOU", "0.20"))
+
+# Filter tiny false positives (fraction of full frame area)
+CARDS_MIN_AREA_FRAC = float(os.getenv("CARDS_MIN_AREA_FRAC", "0.003"))
+
+# Slot hysteresis: require the same new label for N consecutive matches before switching.
+CARDS_LABEL_STICKY_N = int(os.getenv("CARDS_LABEL_STICKY_N", "2"))
+
+# Red/black heuristic to correct suit confusion (especially ♥ vs ♠).
+CARDS_COLOR_SUIT_CORRECT = os.getenv("CARDS_COLOR_SUIT_CORRECT", "1").strip() not in {"0", "false", "False"}
+
+# Further refine suit within red/black using simple contour heuristics.
+CARDS_SUIT_REFINE = os.getenv("CARDS_SUIT_REFINE", "1").strip() not in {"0", "false", "False"}
+
+# Red detection thresholds (tuned for noisy ESP32 cams)
+CARDS_RED_MIN_S = int(os.getenv("CARDS_RED_MIN_S", "30"))
+CARDS_RED_MIN_V = int(os.getenv("CARDS_RED_MIN_V", "28"))
+CARDS_RED_MIN_A = int(os.getenv("CARDS_RED_MIN_A", "138"))
+CARDS_RED_RATIO = float(os.getenv("CARDS_RED_RATIO", "0.006"))
+
+# Extra low-saturation red fallback (BGR heuristic)
+CARDS_RED_BGR_MIN_R = int(os.getenv("CARDS_RED_BGR_MIN_R", "70"))
+CARDS_RED_BGR_DELTA = int(os.getenv("CARDS_RED_BGR_DELTA", "10"))
+
+
+def _clip_bbox(bb, w: int, h: int):
+    try:
+        x1, y1, x2, y2 = [float(v) for v in (bb or [0, 0, 0, 0])]
+        x1i = int(max(0, min(w - 1, round(x1))))
+        y1i = int(max(0, min(h - 1, round(y1))))
+        x2i = int(max(0, min(w - 1, round(x2))))
+        y2i = int(max(0, min(h - 1, round(y2))))
+        if x2i < x1i:
+            x1i, x2i = x2i, x1i
+        if y2i < y1i:
+            y1i, y2i = y2i, y1i
+        return x1i, y1i, x2i, y2i
+    except Exception:
+        return 0, 0, 0, 0
+
+
+def _is_red_region(bgr_img, bbox) -> bool:
+    """Heuristic: determine whether ROI contains 'red' ink.
+
+    Uses HSV (hue wrap-around) + Lab 'a' channel to be robust to poor white balance.
+    """
+    try:
+        if bgr_img is None:
+            return False
+        h, w = bgr_img.shape[:2]
+        x1, y1, x2, y2 = _clip_bbox(bbox, w, h)
+        if (x2 - x1) < 8 or (y2 - y1) < 8:
+            return False
+
+        # Prefer corner ROIs where suit symbol ink lives.
+        bw = x2 - x1
+        bh = y2 - y1
+
+        def _roi_corner(kind: str):
+            if kind == "tl":
+                cx1 = int(x1 + 0.06 * bw)
+                cy1 = int(y1 + 0.10 * bh)
+                cx2 = int(x1 + 0.34 * bw)
+                cy2 = int(y1 + 0.40 * bh)
+            else:
+                cx1 = int(x1 + 0.66 * bw)
+                cy1 = int(y1 + 0.60 * bh)
+                cx2 = int(x1 + 0.94 * bw)
+                cy2 = int(y1 + 0.90 * bh)
+            cx1 = max(0, min(w - 1, cx1))
+            cy1 = max(0, min(h - 1, cy1))
+            cx2 = max(0, min(w - 1, cx2))
+            cy2 = max(0, min(h - 1, cy2))
+            if cx2 <= cx1 or cy2 <= cy1:
+                return None
+            return bgr_img[cy1:cy2, cx1:cx2]
+
+        rois = []
+        for k in ("tl", "br"):
+            r = _roi_corner(k)
+            if r is not None and r.size > 0:
+                rois.append(r)
+        if not rois:
+            roi = bgr_img[y1:y2, x1:x2]
+            if roi.size > 0:
+                rois = [roi]
+        if not rois:
+            return False
+
+        best_ratio = 0.0
+        for roi in rois:
+            roi_s = roi
+            if roi.shape[0] > 120 or roi.shape[1] > 120:
+                roi_s = cv2.resize(roi, (min(120, roi.shape[1]), min(120, roi.shape[0])), interpolation=cv2.INTER_AREA)
+
+            hsv = cv2.cvtColor(roi_s, cv2.COLOR_BGR2HSV)
+            hch = hsv[:, :, 0]
+            sch = hsv[:, :, 1]
+            vch = hsv[:, :, 2]
+            red_h = ((hch <= 10) | (hch >= 170))
+            red_sv = (sch >= CARDS_RED_MIN_S) & (vch >= CARDS_RED_MIN_V)
+            hsv_red = red_h & red_sv
+
+            lab = cv2.cvtColor(roi_s, cv2.COLOR_BGR2LAB)
+            a = lab[:, :, 1]
+            lab_red = a >= CARDS_RED_MIN_A
+
+            # Low-saturation fallback in BGR: R dominates slightly.
+            b, g, r = cv2.split(roi_s)
+            bgr_red = (r >= CARDS_RED_BGR_MIN_R) & ((r.astype(np.int16) - g.astype(np.int16)) >= CARDS_RED_BGR_DELTA) & ((r.astype(np.int16) - b.astype(np.int16)) >= CARDS_RED_BGR_DELTA)
+
+            red_mask = hsv_red | lab_red | bgr_red
+            red_ratio = float(np.count_nonzero(red_mask)) / float(red_mask.size)
+            if red_ratio > best_ratio:
+                best_ratio = red_ratio
+
+        return best_ratio >= CARDS_RED_RATIO
+    except Exception:
+        return False
+
+
+def _red_debug_stats(bgr_img, bbox) -> dict:
+    """Return debug stats for red detection on the same corner ROIs."""
+    out = {"red_ratio": 0.0, "mean_a": None}
+    try:
+        if bgr_img is None:
+            return out
+        h, w = bgr_img.shape[:2]
+        x1, y1, x2, y2 = _clip_bbox(bbox, w, h)
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw < 16 or bh < 16:
+            return out
+
+        def _roi(kind: str):
+            if kind == "tl":
+                cx1 = int(x1 + 0.06 * bw)
+                cy1 = int(y1 + 0.10 * bh)
+                cx2 = int(x1 + 0.34 * bw)
+                cy2 = int(y1 + 0.40 * bh)
+            else:
+                cx1 = int(x1 + 0.66 * bw)
+                cy1 = int(y1 + 0.60 * bh)
+                cx2 = int(x1 + 0.94 * bw)
+                cy2 = int(y1 + 0.90 * bh)
+            cx1 = max(0, min(w - 1, cx1))
+            cy1 = max(0, min(h - 1, cy1))
+            cx2 = max(0, min(w - 1, cx2))
+            cy2 = max(0, min(h - 1, cy2))
+            if cx2 <= cx1 or cy2 <= cy1:
+                return None
+            return bgr_img[cy1:cy2, cx1:cx2]
+
+        rois = [r for r in (_roi("tl"), _roi("br")) if r is not None and r.size > 0]
+        if not rois:
+            return out
+
+        best_ratio = 0.0
+        best_mean_a = None
+        for rr in rois:
+            roi_s = rr
+            if rr.shape[0] > 120 or rr.shape[1] > 120:
+                roi_s = cv2.resize(rr, (min(120, rr.shape[1]), min(120, rr.shape[0])), interpolation=cv2.INTER_AREA)
+
+            hsv = cv2.cvtColor(roi_s, cv2.COLOR_BGR2HSV)
+            hch = hsv[:, :, 0]
+            sch = hsv[:, :, 1]
+            vch = hsv[:, :, 2]
+            red_h = ((hch <= 10) | (hch >= 170))
+            red_sv = (sch >= CARDS_RED_MIN_S) & (vch >= CARDS_RED_MIN_V)
+            hsv_red = red_h & red_sv
+
+            lab = cv2.cvtColor(roi_s, cv2.COLOR_BGR2LAB)
+            a = lab[:, :, 1]
+            lab_red = a >= CARDS_RED_MIN_A
+            mean_a = float(np.mean(a)) if a.size else None
+
+            b, g, r = cv2.split(roi_s)
+            bgr_red = (r >= CARDS_RED_BGR_MIN_R) & ((r.astype(np.int16) - g.astype(np.int16)) >= CARDS_RED_BGR_DELTA) & ((r.astype(np.int16) - b.astype(np.int16)) >= CARDS_RED_BGR_DELTA)
+
+            red_mask = hsv_red | lab_red | bgr_red
+            red_ratio = float(np.count_nonzero(red_mask)) / float(red_mask.size)
+            if red_ratio > best_ratio:
+                best_ratio = red_ratio
+                best_mean_a = mean_a
+
+        out["red_ratio"] = float(best_ratio)
+        out["mean_a"] = best_mean_a
+        return out
+    except Exception:
+        return out
+
+
+def _infer_suit_from_card_roi(bgr_img, bbox) -> tuple[str | None, float]:
+    """Infer suit by color group + contour shape.
+
+    Goal: reduce systematic YOLO suit confusion by using image evidence.
+    - First decide red vs black using pixel masks.
+    - Then distinguish ♥ vs ♦ and ♠ vs ♣ using convexity defects.
+
+    This is heuristic and intentionally conservative: returns None if ROI isn't confident.
+    """
+    if not CARDS_SUIT_REFINE:
+        return None, 0.0
+    try:
+        if bgr_img is None:
+            return None, 0.0
+        h, w = bgr_img.shape[:2]
+        x1, y1, x2, y2 = _clip_bbox(bbox, w, h)
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw < 24 or bh < 24:
+            return None, 0.0
+
+        # Use the top-left corner where rank+suit is usually printed.
+        # Also sample bottom-right to be robust to occlusion.
+        def _corner_roi(kind: str):
+            if kind == "tl":
+                cx1 = int(x1 + 0.05 * bw)
+                cy1 = int(y1 + 0.05 * bh)
+                cx2 = int(x1 + 0.40 * bw)
+                cy2 = int(y1 + 0.40 * bh)
+            else:
+                cx1 = int(x1 + 0.60 * bw)
+                cy1 = int(y1 + 0.60 * bh)
+                cx2 = int(x1 + 0.95 * bw)
+                cy2 = int(y1 + 0.95 * bh)
+            cx1 = max(0, min(w - 1, cx1))
+            cy1 = max(0, min(h - 1, cy1))
+            cx2 = max(0, min(w - 1, cx2))
+            cy2 = max(0, min(h - 1, cy2))
+            if cx2 <= cx1 or cy2 <= cy1:
+                return None
+            roi = bgr_img[cy1:cy2, cx1:cx2]
+            return roi
+
+        rois = []
+        for k in ("tl", "br"):
+            r = _corner_roi(k)
+            if r is not None and r.size > 0:
+                rois.append(r)
+        if not rois:
+            return None, 0.0
+
+        def _classify_roi(roi) -> tuple[str | None, float]:
+            # Returns (suit or None, confidence_score)
+            # Downsample for speed.
+            rr = roi
+            if rr.shape[0] > 140 or rr.shape[1] > 140:
+                rr = cv2.resize(rr, (min(140, rr.shape[1]), min(140, rr.shape[0])), interpolation=cv2.INTER_AREA)
+
+            # Robust red mask (HSV + Lab)
+            hsv = cv2.cvtColor(rr, cv2.COLOR_BGR2HSV)
+            hch = hsv[:, :, 0]
+            sch = hsv[:, :, 1]
+            vch = hsv[:, :, 2]
+            red_h = ((hch <= 10) | (hch >= 170))
+            red_sv = (sch >= CARDS_RED_MIN_S) & (vch >= CARDS_RED_MIN_V)
+            hsv_red = red_h & red_sv
+            lab = cv2.cvtColor(rr, cv2.COLOR_BGR2LAB)
+            a = lab[:, :, 1]
+            lab_red = a >= CARDS_RED_MIN_A
+            red_mask = (hsv_red | lab_red)
+
+            # Black ink on white: low value in grayscale.
+            gray = cv2.cvtColor(rr, cv2.COLOR_BGR2GRAY)
+            dark_mask = gray < 70
+
+            red_ratio = float(np.count_nonzero(red_mask)) / float(red_mask.size)
+            dark_ratio = float(np.count_nonzero(dark_mask)) / float(dark_mask.size)
+
+            # Decide color group.
+            # Keep a small floor but allow tuning to be more sensitive.
+            is_red = red_ratio >= max(0.005, CARDS_RED_RATIO * 0.8)
+            is_black = (not is_red) and (dark_ratio >= 0.02)
+            if not (is_red or is_black):
+                return None, 0.0
+
+            mask = (red_mask if is_red else dark_mask).astype(np.uint8) * 255
+            # Clean small noise.
+            mask = cv2.medianBlur(mask, 3)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                return None, 0.0
+            cnt = max(cnts, key=cv2.contourArea)
+            area = float(cv2.contourArea(cnt))
+            if area < 60:
+                return None, 0.0
+
+            # Convexity defects count as a proxy for lobes/indentations.
+            defects_n = 0
+            try:
+                hull = cv2.convexHull(cnt, returnPoints=False)
+                if hull is not None and len(hull) >= 3 and len(cnt) >= 4:
+                    defects = cv2.convexityDefects(cnt, hull)
+                    if defects is not None:
+                        # Count only significant defects (depth threshold)
+                        for i in range(defects.shape[0]):
+                            d = defects[i, 0, 3]  # *256
+                            if d > 800:  # about 3px depth
+                                defects_n += 1
+            except Exception:
+                defects_n = 0
+
+            # Approx polygon corners: diamonds tend to be very low vertex counts.
+            corners = 0
+            try:
+                peri = cv2.arcLength(cnt, True)
+                approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
+                corners = int(len(approx)) if approx is not None else 0
+            except Exception:
+                corners = 0
+
+            # Confidence roughly from ink ratio and contour area.
+            ink_ratio = red_ratio if is_red else dark_ratio
+            score = min(1.0, ink_ratio * 12.0) * min(1.0, area / 600.0)
+
+            if is_red:
+                # ♦ is convex (usually 0 defects), ♥ has top indentation (>=1 defects).
+                if defects_n >= 1:
+                    return "hearts", score
+                # If it looks like a simple polygon, it's more likely ♦.
+                if 3 <= corners <= 7:
+                    return "diamonds", score
+                return "diamonds", score * 0.7
+            else:
+                # ♣ tends to have more concavities between lobes than ♠.
+                if defects_n >= 2:
+                    return "clubs", score
+                return "spades", score
+
+        best_suit: str | None = None
+        best_score: float = 0.0
+        for roi in rois:
+            suit, score = _classify_roi(roi)
+            if suit and score > best_score:
+                best_suit = suit
+                best_score = score
+
+        return best_suit, float(best_score)
+    except Exception:
+        return None, 0.0
+
+
+def _correct_suit_by_color(bgr_img, bbox, suit: str | None) -> str | None:
+    if not CARDS_COLOR_SUIT_CORRECT:
+        return suit
+    if not suit:
+        return suit
+    try:
+        # Prefer ROI-based inference (less dependent on YOLO's suit label).
+        inferred_suit, inferred_score = _infer_suit_from_card_roi(bgr_img, bbox)
+        if inferred_suit and inferred_score >= 0.08:
+            return inferred_suit
+
+        # If inference is weak, still enforce red/black consistency as a hard rule.
+        is_red = _is_red_region(bgr_img, bbox)
+        if is_red:
+            # Only allow red suits.
+            if inferred_suit in {"hearts", "diamonds"}:
+                return inferred_suit
+            s = str(suit)
+            if s in {"hearts", "diamonds"}:
+                return s
+            # If YOLO says black but ROI seems red, default to hearts (more common confusion target).
+            return "hearts"
+        else:
+            # Only allow black suits.
+            if inferred_suit in {"spades", "clubs"}:
+                return inferred_suit
+            s = str(suit)
+            if s in {"spades", "clubs"}:
+                return s
+            return "spades"
+    except Exception:
+        return suit
+
+
+def _hist_push(slot: dict, key: str, val: str, maxlen: int = 8) -> None:
+    try:
+        hist = slot.get(key)
+        if not isinstance(hist, list):
+            hist = []
+        hist.append(str(val))
+        if len(hist) > maxlen:
+            hist = hist[-maxlen:]
+        slot[key] = hist
+    except Exception:
+        return
+
+
+def _hist_majority(slot: dict, key: str) -> str | None:
+    try:
+        hist = slot.get(key)
+        if not isinstance(hist, list) or not hist:
+            return None
+        counts: dict[str, int] = {}
+        for v in hist:
+            vs = str(v)
+            if not vs:
+                continue
+            counts[vs] = counts.get(vs, 0) + 1
+        if not counts:
+            return None
+        best = max(counts.items(), key=lambda kv: kv[1])[0]
+        return best
+    except Exception:
+        return None
+
+
+def _rank_suit_to_label(rank: str | None, suit: str | None) -> str | None:
+    if not rank or not suit:
+        return None
+    r = str(rank).upper().replace("10", "T")
+    suit_ch = {"spades": "S", "hearts": "H", "diamonds": "D", "clubs": "C"}.get(str(suit), "")
+    if not suit_ch:
+        return None
+    return f"{r}{suit_ch}"
 
 
 def _project_root_dir() -> Path:
@@ -295,8 +766,11 @@ def _run_cards_mode(*, headless: bool, stop_event=None):
         else:
             print(f"[CARDS] model loaded: {model_path}", flush=True)
 
+    global _cards_last_t, _cards_last_dets, _cards_last_slots, _cards_last_hole_cards
+
     frame_idx = 0
     last_dets = []
+    slots: list[dict] = []  # each: {bbox,label,rank,suit,display,conf,last_seen}
 
     while True:
         if stop_event and stop_event.is_set():
@@ -352,12 +826,196 @@ def _run_cards_mode(*, headless: bool, stop_event=None):
                         label = names.get(cid, str(cid))
                         dets.append((x1, y1, x2, y2, conf, label))
                 last_dets = dets
+
+                # Publish detections for backend APIs.
+                try:
+                    published = []
+                    frame_area = float(max(1, H * W))
+                    for (x1, y1, x2, y2, conf, label) in last_dets:
+                        rank, suit = _parse_card_label_to_rank_suit(label)
+                        bbox = [float(x1), float(y1), float(x2), float(y2)]
+                        # Filter tiny boxes.
+                        try:
+                            bb_area = max(0.0, float(x2) - float(x1)) * max(0.0, float(y2) - float(y1))
+                            if (bb_area / frame_area) < CARDS_MIN_AREA_FRAC:
+                                continue
+                        except Exception:
+                            pass
+
+                        inferred_suit, inferred_score = _infer_suit_from_card_roi(vis, bbox)
+                        suit2 = _correct_suit_by_color(vis, bbox, suit)
+                        label2 = _rank_suit_to_label(rank, suit2) or str(label)
+                        dbg = _red_debug_stats(vis, bbox)
+                        published.append(
+                            {
+                                "rank": rank,
+                                "suit": suit2,
+                                "conf": float(conf),
+                                "label": str(label2),
+                                "display": _card_label_to_display(label2),
+                                "bbox": bbox,
+                                "debug": {
+                                    "red_ratio": float(dbg.get("red_ratio") or 0.0),
+                                    "mean_a": dbg.get("mean_a"),
+                                    "inferred_suit": inferred_suit,
+                                    "inferred_score": float(inferred_score),
+                                    "raw_label": str(label),
+                                    "raw_suit": suit,
+                                },
+                            }
+                        )
+                    with _cards_last_lock:
+                        _cards_last_t = time.monotonic()
+                        _cards_last_dets = published
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"[CARDS] infer failed: {e}", flush=True)
 
         # 叠加显示
         ui_reset_overlay(H)
-        draw_text_cn(vis, f"Cards detected: {len(last_dets)}", (10, 30), font_size=18, color=FRONTEND_COLORS["text"], stroke=(0, 0, 0))
+        # Update 2-slot tracker every frame (even when inference is skipped)
+        now_m = time.monotonic()
+        try:
+            # Build a lightweight list of parseable detections.
+            det_objs: list[dict] = []
+            frame_area = float(max(1, H * W))
+            for (x1, y1, x2, y2, conf, label) in last_dets:
+                rank, suit = _parse_card_label_to_rank_suit(label)
+                if not rank or not suit:
+                    continue
+                bbox = [float(x1), float(y1), float(x2), float(y2)]
+                # Filter tiny boxes.
+                try:
+                    bb_area = max(0.0, float(x2) - float(x1)) * max(0.0, float(y2) - float(y1))
+                    if (bb_area / frame_area) < CARDS_MIN_AREA_FRAC:
+                        continue
+                except Exception:
+                    pass
+
+                suit2 = _correct_suit_by_color(vis, bbox, suit)
+                label2 = _rank_suit_to_label(rank, suit2) or str(label)
+                det_objs.append(
+                    {
+                        "bbox": bbox,
+                        "label": str(label2),
+                        "rank": rank,
+                        "suit": suit2,
+                        "display": _card_label_to_display(label2),
+                        "conf": float(conf),
+                    }
+                )
+
+            # Age out old slots.
+            alive_slots: list[dict] = []
+            for s in slots:
+                if (now_m - float(s.get("last_seen", 0.0))) <= CARDS_SLOT_TTL_SEC:
+                    alive_slots.append(s)
+            slots = alive_slots
+
+            # Match detections to existing slots by IoU.
+            used_det = set()
+            for s in slots:
+                best_iou = 0.0
+                best_j = -1
+                for j, d in enumerate(det_objs):
+                    if j in used_det:
+                        continue
+                    iou = _bbox_iou(s.get("bbox"), d.get("bbox"))
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_j = j
+                if best_j != -1 and best_iou >= CARDS_MATCH_IOU:
+                    d = det_objs[best_j]
+                    used_det.add(best_j)
+                    # Hysteresis: avoid rapid label flipping (esp. suit confusion).
+                    new_label = str(d.get("label") or "")
+                    old_label = str(s.get("label") or "")
+                    if not old_label:
+                        s.update(d)
+                        s.pop("candidate_label", None)
+                        s.pop("candidate_count", None)
+                        # seed history
+                        if d.get("rank"):
+                            _hist_push(s, "rank_hist", str(d.get("rank")))
+                        if d.get("suit"):
+                            _hist_push(s, "suit_hist", str(d.get("suit")))
+                    elif new_label == old_label:
+                        # stable match
+                        s.update(d)
+                        s.pop("candidate_label", None)
+                        s.pop("candidate_count", None)
+                        if d.get("rank"):
+                            _hist_push(s, "rank_hist", str(d.get("rank")))
+                        if d.get("suit"):
+                            _hist_push(s, "suit_hist", str(d.get("suit")))
+                    else:
+                        cand = str(s.get("candidate_label") or "")
+                        cnt = int(s.get("candidate_count") or 0)
+                        if cand != new_label:
+                            cand = new_label
+                            cnt = 1
+                        else:
+                            cnt += 1
+                        s["candidate_label"] = cand
+                        s["candidate_count"] = cnt
+                        # If the new label persists, accept it.
+                        if cnt >= CARDS_LABEL_STICKY_N:
+                            s.update(d)
+                            s.pop("candidate_label", None)
+                            s.pop("candidate_count", None)
+                            if d.get("rank"):
+                                _hist_push(s, "rank_hist", str(d.get("rank")))
+                            if d.get("suit"):
+                                _hist_push(s, "suit_hist", str(d.get("suit")))
+                    s["last_seen"] = now_m
+
+                    # Majority vote (over recent history) to stabilize suit/rank.
+                    try:
+                        mr = _hist_majority(s, "rank_hist")
+                        ms = _hist_majority(s, "suit_hist")
+                        if mr:
+                            s["rank"] = mr
+                        if ms:
+                            s["suit"] = ms
+                        # Rebuild label/display from voted rank/suit.
+                        lbl = _rank_suit_to_label(s.get("rank"), s.get("suit"))
+                        if lbl:
+                            s["label"] = lbl
+                            s["display"] = _card_label_to_display(lbl)
+                    except Exception:
+                        pass
+
+            # Fill remaining slots up to 2.
+            if len(slots) < 2:
+                # Sort remaining dets by confidence.
+                remaining = [det_objs[j] for j in range(len(det_objs)) if j not in used_det]
+                remaining.sort(key=lambda x: float(x.get("conf", 0.0)), reverse=True)
+                for d in remaining:
+                    if len(slots) >= 2:
+                        break
+                    # Avoid duplicate labels in slots (same card twice).
+                    if any(str(s.get("label")) == str(d.get("label")) for s in slots):
+                        continue
+                    nd = dict(d)
+                    nd["last_seen"] = now_m
+                    slots.append(nd)
+
+            # Keep slots stable ordering by x position (left/right) when possible.
+            try:
+                slots.sort(key=lambda s: float((s.get("bbox") or [0, 0, 0, 0])[0]))
+            except Exception:
+                pass
+
+            hole_cards_display = [str(s.get("display")) for s in slots if s.get("display")]
+        except Exception:
+            hole_cards_display = []
+
+        if hole_cards_display:
+            draw_text_cn(vis, f"Hole: {' '.join(hole_cards_display[:2])}", (10, 30), font_size=18, color=FRONTEND_COLORS["ok"], stroke=(0, 0, 0))
+            draw_text_cn(vis, f"Cards detected: {len(last_dets)}", (10, 54), font_size=16, color=FRONTEND_COLORS["text"], stroke=(0, 0, 0))
+        else:
+            draw_text_cn(vis, f"Cards detected: {len(last_dets)}", (10, 30), font_size=18, color=FRONTEND_COLORS["text"], stroke=(0, 0, 0))
 
         for (x1, y1, x2, y2, conf, label) in last_dets:
             x1i = int(max(0, min(W - 1, round(x1))))
@@ -371,6 +1029,28 @@ def _run_cards_mode(*, headless: bool, stop_event=None):
             tx = x1i
             ty = max(0, y1i - 6)
             draw_text_cn(vis, f"{disp}", (tx, ty), font_size=18, color=FRONTEND_COLORS["ok"], stroke=(0, 0, 0), ui_hint=False)
+
+        # Draw stabilized slots with thicker boxes to make them obvious.
+        try:
+            for s in slots:
+                bb = s.get("bbox") or [0, 0, 0, 0]
+                sx1, sy1, sx2, sy2 = [int(round(float(v))) for v in bb]
+                sx1 = int(max(0, min(W - 1, sx1)))
+                sy1 = int(max(0, min(H - 1, sy1)))
+                sx2 = int(max(0, min(W - 1, sx2)))
+                sy2 = int(max(0, min(H - 1, sy2)))
+                cv2.rectangle(vis, (sx1, sy1), (sx2, sy2), (126, 231, 135), 3)
+        except Exception:
+            pass
+
+        # Publish detections/slots for backend.
+        try:
+            with _cards_last_lock:
+                _cards_last_t = float(now_m)
+                _cards_last_slots = [dict(s) for s in slots]
+                _cards_last_hole_cards = [str(s.get("label")) for s in slots if s.get("label")][:2]
+        except Exception:
+            pass
 
         bridge_io.send_vis_bgr(vis)
         if headless:

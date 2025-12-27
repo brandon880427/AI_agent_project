@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 import bridge_io
 import threading
+import poker_ev
 try:
     import yolomedia  # 确保和 app_main.py 同目录，文件名就是 yolomedia.py
 except Exception:
@@ -152,9 +153,10 @@ async def _ollama_list_models() -> list[str]:
 async def _ollama_choose_model(preferred: str, *, prefer_vision: bool = False) -> tuple[Optional[str], Optional[str]]:
     """Choose a usable Ollama model; returns (model, warning)."""
     preferred = (preferred or "").strip()
+    warn_prefix = "[AI] (vision)" if prefer_vision else "[AI] (text)"
     models = await _ollama_list_models()
     if not models:
-        return None, "[AI] (vision) Ollama has no models available (or is unreachable)."
+        return None, f"{warn_prefix} Ollama has no models available (or is unreachable)."
 
     if preferred:
         if preferred in models:
@@ -162,7 +164,7 @@ async def _ollama_choose_model(preferred: str, *, prefer_vision: bool = False) -
         prefix = preferred + ":"
         for m in models:
             if m.startswith(prefix):
-                return m, f"[AI] (vision) Requested model '{preferred}' not found; using '{m}'."
+                return m, f"{warn_prefix} Requested model '{preferred}' not found; using '{m}'."
 
     if prefer_vision:
         for m in models:
@@ -170,13 +172,13 @@ async def _ollama_choose_model(preferred: str, *, prefer_vision: bool = False) -
             if "llava" in lm or "vision" in lm:
                 warn = None
                 if preferred:
-                    warn = f"[AI] (vision) Requested model '{preferred}' not found; using '{m}'."
+                    warn = f"{warn_prefix} Requested model '{preferred}' not found; using '{m}'."
                 return m, warn
 
     # Fallback: first available model.
     warn = None
     if preferred:
-        warn = f"[AI] (vision) Requested model '{preferred}' not found; using '{models[0]}'."
+        warn = f"{warn_prefix} Requested model '{preferred}' not found; using '{models[0]}'."
     return models[0], warn
 
 
@@ -341,6 +343,16 @@ class DescribeRequest(BaseModel):
     prompt: Optional[str] = None
 
 
+class PokerAdviceRequest(BaseModel):
+    # If provided, overrides YOLO detections.
+    cards: Optional[List[str]] = None  # e.g. ["As", "Kd"]
+    num_opponents: int = 1
+    iters: int = 2000
+    pot: Optional[float] = None
+    to_call: Optional[float] = None
+    use_llm: bool = True
+
+
 async def _ollama_describe_image(jpeg_bytes: bytes, prompt: Optional[str] = None) -> str:
     requested = (OLLAMA_VISION_MODEL or OLLAMA_MODEL).strip()
     model, warn = await _ollama_choose_model(requested, prefer_vision=True)
@@ -391,6 +403,56 @@ async def _ollama_describe_image(jpeg_bytes: bytes, prompt: Optional[str] = None
         content = ""
     content = (content or "").strip()
     return content or "(no description generated)"
+
+
+async def _ollama_chat_text(prompt: str) -> str:
+    """Chat with a text-only model via Ollama."""
+    requested = (OLLAMA_MODEL or OLLAMA_VISION_MODEL).strip()
+    model, warn = await _ollama_choose_model(requested, prefer_vision=False)
+    # Don't broadcast model-fallback warnings to the UI for text chat.
+    # (It is confusing during Poker EV; we still log it for debugging.)
+    if warn:
+        try:
+            print(warn, flush=True)
+        except Exception:
+            pass
+    if not model:
+        raise RuntimeError("Ollama not available or has no models")
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "options": {
+            "num_predict": OLLAMA_NUM_PREDICT,
+            "temperature": OLLAMA_TEMPERATURE,
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": (prompt or "").strip(),
+            }
+        ],
+    }
+
+    timeout = httpx.Timeout(connect=5.0, read=60.0, write=30.0, pool=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(f"{OLLAMA_URL.rstrip('/')}/api/chat", json=payload)
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(str(data.get("error")))
+        r.raise_for_status()
+        if data is None:
+            data = r.json()
+
+    content = ""
+    try:
+        content = (data.get("message") or {}).get("content") or ""
+    except Exception:
+        content = ""
+    return (content or "").strip()
 
 
 async def _describe_current_frame(prompt: Optional[str] = None) -> None:
@@ -611,6 +673,18 @@ async def api_cards_stop() -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
+@app.get("/api/cards/dets")
+async def api_cards_dets() -> Dict[str, Any]:
+    """Return latest cards detections from yolomedia (if available)."""
+    if yolomedia is None or not hasattr(yolomedia, "get_latest_cards_dets"):
+        return {"ok": False, "error": "yolomedia_unavailable"}
+    try:
+        st = yolomedia.get_latest_cards_dets()  # type: ignore[attr-defined]
+        return {"ok": True, "state": st}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/api/camera/snap")
 async def api_camera_snap() -> Dict[str, Any]:
     jpeg = await _esp32_request_hq_snapshot()
@@ -639,6 +713,143 @@ async def api_describe(req: DescribeRequest):
 
     asyncio.create_task(_run())
     return {"ok": True, "status": "accepted"}
+
+
+@app.post("/api/poker/advice")
+async def api_poker_advice(req: PokerAdviceRequest) -> Dict[str, Any]:
+    """Texas Hold'em preflop: estimate equity / EV and suggest bet/call/fold.
+
+    Default behavior uses the latest 2 cards from YOLO (cards mode).
+    You can override by sending {"cards": ["As","Kd"]}.
+    """
+
+    def _pick_two_from_yolo() -> tuple[list[str], dict]:
+        if yolomedia is None or not hasattr(yolomedia, "get_latest_cards_dets"):
+            return [], {"ok": False, "error": "yolomedia_cards_state_unavailable"}
+        st = yolomedia.get_latest_cards_dets()  # type: ignore[attr-defined]
+
+        # Prefer stabilized tracker output when available.
+        try:
+            hole_cards = list((st or {}).get("hole_cards") or [])
+            hole_cards = [str(x).strip() for x in hole_cards if str(x).strip()]
+            if len(hole_cards) >= 2:
+                chosen = [hole_cards[0], hole_cards[1]]
+                return chosen, {"ok": True, "yolo": st, "picked": "hole_cards"}
+        except Exception:
+            pass
+
+        dets = list((st or {}).get("dets") or [])
+        # Keep only parseable card labels.
+        cleaned: list[dict] = []
+        for d in dets:
+            try:
+                rank = d.get("rank")
+                suit = d.get("suit")
+                disp = d.get("display")
+                conf = float(d.get("conf") or 0.0)
+                if not rank or not suit:
+                    continue
+                # Convert to compact format like "AS".
+                suit_ch = {"spades": "S", "hearts": "H", "diamonds": "D", "clubs": "C"}.get(str(suit), "")
+                r = str(rank).upper().replace("10", "T")
+                if suit_ch and r:
+                    cleaned.append({"card": f"{r}{suit_ch}", "conf": conf, "display": disp, "raw": d})
+            except Exception:
+                continue
+        cleaned.sort(key=lambda x: x.get("conf", 0.0), reverse=True)
+
+        chosen: list[str] = []
+        seen: set[str] = set()
+        for c in cleaned:
+            s = str(c["card"]).upper().strip()
+            if s in seen:
+                continue
+            seen.add(s)
+            chosen.append(s)
+            if len(chosen) >= 2:
+                break
+        return chosen, {"ok": True, "yolo": st, "picked": cleaned[:8]}
+
+    # 1) Determine hole cards.
+    cards_in: list[str] = []
+    if req.cards:
+        cards_in = [str(x).strip() for x in req.cards if str(x).strip()]
+    else:
+        cards_in, yolo_dbg = _pick_two_from_yolo()
+        if not cards_in:
+            return {
+                "ok": False,
+                "error": "no_cards_detected",
+                "hint": "Start YOLO cards first: POST /api/cards/start, then ensure two cards are visible.",
+                "debug": yolo_dbg,
+            }
+
+    if len(cards_in) < 2:
+        return {"ok": False, "error": "need_two_cards", "cards": cards_in}
+
+    # Normalize formats: allow A♠, As, 10h, etc.
+    try:
+        hole = [poker_ev.parse_card(cards_in[0]), poker_ev.parse_card(cards_in[1])]
+    except Exception as e:
+        return {"ok": False, "error": "invalid_cards", "cards": cards_in[:2], "detail": str(e)}
+
+    # 2) Compute equity in a worker thread to avoid blocking the event loop.
+    num_opponents = int(req.num_opponents or 1)
+    iters = int(req.iters or 2000)
+    try:
+        equity = await asyncio.to_thread(
+            poker_ev.estimate_equity,
+            hole,
+            num_opponents=num_opponents,
+            iters=iters,
+        )
+    except Exception as e:
+        return {"ok": False, "error": "equity_failed", "detail": str(e)}
+
+    advice = poker_ev.advise_action(equity, pot_before_call=req.pot, to_call=req.to_call)
+
+    result: Dict[str, Any] = {
+        "ok": True,
+        "cards": [poker_ev.format_card(hole[0]), poker_ev.format_card(hole[1])],
+        "num_opponents": num_opponents,
+        "iters": iters,
+        "equity": float(advice.equity),
+        "pot_odds": (float(advice.pot_odds) if advice.pot_odds is not None else None),
+        "ev_call": (float(advice.ev_call) if advice.ev_call is not None else None),
+        "action": advice.action,
+        "reason": advice.reason,
+    }
+
+    # 3) Ask LLM for a natural-language recommendation (optional).
+    if req.use_llm:
+        try:
+            prompt = (
+                "你是德州撲克教練。\n"
+                "我手牌是兩張（preflop）: {c1} {c2}\n"
+                "注意：請不要把這兩張牌說錯（例如誤說成一對）。\n"
+                "對手數量(隨機範圍假設): {n} 人\n"
+                "蒙地卡羅估計勝率(=equity): {eq:.3f}\n"
+            ).format(c1=result["cards"][0], c2=result["cards"][1], n=num_opponents, eq=result["equity"])
+            if req.pot is not None and req.to_call is not None:
+                prompt += (
+                    f"目前底池(我跟注前): {req.pot}\n"
+                    f"我需要跟注金額: {req.to_call}\n"
+                    f"估計跟注EV: {result['ev_call']}\n"
+                    f"需要勝率(底池賠率門檻): {result['pot_odds']}\n"
+                )
+            prompt += (
+                "\n請用繁體中文回答，給出：\n"
+                "1) 這手牌大致強度解讀\n"
+                "2) 建議動作：bet / call / raise / fold / check（選一個最適合）\n"
+                "3) 用1-3句說明理由（不要太長，不要重複列出數字）\n"
+            )
+
+            llm_text = await _ollama_chat_text(prompt)
+            result["llm"] = llm_text
+        except Exception as e:
+            result["llm_error"] = str(e)
+
+    return result
 
 # ---------- WebSocket：WebUI 文本（ASR/AI 状态推送） ----------
 @app.websocket("/ws_ui")

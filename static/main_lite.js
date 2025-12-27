@@ -10,6 +10,7 @@
   const $btnClear = document.getElementById('btnClear');
   const $btnDescribe = document.getElementById('btnDescribe');
   const $btnCards = document.getElementById('btnCards');
+  const $btnPoker = document.getElementById('btnPoker');
 
   const $chat = document.getElementById('chatContainer');
 
@@ -41,6 +42,22 @@
     $chat.scrollTop = $chat.scrollHeight;
   }
 
+  async function postJSON(url, body) {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body ?? {}),
+    });
+    const txt = await r.text();
+    let data = null;
+    try { data = JSON.parse(txt); } catch (e) { data = { raw: txt }; }
+    if (!r.ok) {
+      const msg = (data && (data.error || data.detail)) ? `${data.error || data.detail}` : `HTTP ${r.status}`;
+      throw new Error(msg);
+    }
+    return data;
+  }
+
   function fitCanvas() {
     const rect = canvas.getBoundingClientRect();
     const dpr = Math.max(1, window.devicePixelRatio || 1);
@@ -53,6 +70,11 @@
 
   window.addEventListener('resize', fitCanvas);
   requestAnimationFrame(fitCanvas);
+
+  // ===== Controls =====
+  if ($btnPoker) {
+    $btnPoker.addEventListener('click', () => { doPokerAdvice(); });
+  }
 
   // ===== Camera viewer (/ws/viewer) =====
   let camWs = null;
@@ -312,6 +334,38 @@
       setBadge($camStatus, false, 'Camera: error');
       try { camWs.close(); } catch (e) {}
     };
+  }
+
+  async function doPokerAdvice() {
+    try {
+      addMessage('Poker EV: calculating…', true);
+      // Default: use YOLO detected top-2 cards.
+      const res = await postJSON('/api/poker/advice', {
+        num_opponents: 1,
+        iters: 2000,
+        use_llm: true,
+      });
+
+      if (!res || !res.ok) {
+        addMessage(`Poker EV failed: ${JSON.stringify(res)}`);
+        return;
+      }
+
+      const lines = [];
+      lines.push(`Hand: ${res.cards?.join(' ') || '--'}`);
+      lines.push(`Equity (vs ${res.num_opponents} random): ${(Number(res.equity) * 100).toFixed(1)}%`);
+      if (res.pot_odds != null) lines.push(`Pot odds: ${(Number(res.pot_odds) * 100).toFixed(1)}%`);
+      if (res.ev_call != null) lines.push(`EV(call): ${Number(res.ev_call).toFixed(3)}`);
+      lines.push(`Action: ${res.action} (${res.reason || ''})`);
+      addMessage(lines.join('\n'));
+      if (res.llm) {
+        addMessage(String(res.llm));
+      } else if (res.llm_error) {
+        addMessage(`LLM error: ${res.llm_error}`);
+      }
+    } catch (e) {
+      addMessage(`Poker EV error: ${e?.message || e}`);
+    }
   }
 
   // ===== UI chat (/ws_ui) =====
